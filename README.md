@@ -1,4 +1,4 @@
-# betterLINE
+# lineMCP
 
 A self-hosted bridge to a **personal** LINE account: an MCP server so Claude (web, desktop, mobile, Claude Code) can read and send your messages as a custom connector, and betterLINE, a native macOS client built on the same server.
 
