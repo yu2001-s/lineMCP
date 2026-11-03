@@ -173,6 +173,20 @@ struct MessagePage: Decodable, Sendable {
 	var olderCursor: String?
 }
 
+/// Member mid → id of the newest message they have read.
+struct ReadMarkers: Decodable, Sendable {
+	var readers: [String: String]
+}
+
+enum MessageOrder {
+	/// LINE message ids grow over time, so two ids order their messages even
+	/// when neither message is loaded.
+	static func id(_ a: String, isAtLeast b: String) -> Bool {
+		if let x = UInt64(a), let y = UInt64(b) { return x >= y }
+		return a.count != b.count ? a.count > b.count : a >= b
+	}
+}
+
 struct SentMessage: Decodable, Sendable {
 	var messageId: String
 }
@@ -233,6 +247,66 @@ struct SyncResults: Decodable, Sendable {
 	var results: [SyncResult]
 }
 
+/// The owner's folders, hidden chats and tags as the server keeps them
+/// (`/api/organizer`), so the MCP tools can use them too.
+struct OrganizerState: Codable, Sendable, Equatable {
+	struct Folder: Codable, Sendable, Equatable {
+		var id: UUID
+		var name: String
+		var chatIds: [String]
+	}
+
+	struct HiddenChat: Codable, Sendable, Equatable {
+		var chatId: String
+		var name: String
+	}
+
+	struct TaggedChat: Codable, Sendable, Equatable {
+		var chatId: String
+		var tags: [String]
+	}
+
+	var folders: [Folder]
+	var hidden: [HiddenChat]
+	/// Set by the server; 0 until a Mac has saved one.
+	var updatedMs: Int64?
+	/// Sent by the server, never by this Mac: tags only change through `TagOp`s.
+	/// nil from a server older than tags.
+	var tags: [TaggedChat]?
+	/// Goes up with every change on the server.
+	var rev: Int?
+
+	/// Folders and hidden chats, the part this Mac saves.
+	func sameContent(as other: OrganizerState) -> Bool {
+		folders == other.folders && hidden == other.hidden
+	}
+}
+
+/// The body of `PUT /api/organizer`.
+struct OrganizerSave: Encodable, Sendable {
+	var folders: [OrganizerState.Folder]
+	var hidden: [OrganizerState.HiddenChat]
+	var baseRev: Int
+}
+
+/// One change to tags (`POST /api/organizer/tags`). The server applies them in
+/// order on top of what agents changed meanwhile, so neither side overwrites
+/// the other's tags.
+struct TagOp: Codable, Sendable, Equatable, Identifiable {
+	enum Kind: String, Codable, Sendable {
+		case add, remove, rename, delete
+	}
+
+	var id = UUID()
+	var op: Kind
+	/// The tags to add or remove, or the one tag to rename or delete.
+	var tags: [String]
+	/// For add and remove.
+	var chatIds: [String]?
+	/// The new name, for rename.
+	var to: String?
+}
+
 enum ReactionType: String, CaseIterable, Sendable {
 	case nice = "NICE", love = "LOVE", fun = "FUN", amazing = "AMAZING", sad = "SAD", omg = "OMG"
 
@@ -272,6 +346,8 @@ enum LineEvent: Sendable {
 	case reaction(chatId: String, messageId: String?)
 	case chatUpdate(chatId: String)
 	case status(SessionStatus)
+	/// Folders or hidden chats changed, from this Mac or another one.
+	case organizer
 	case unknown
 }
 
@@ -302,6 +378,8 @@ extension LineEvent: Decodable {
 			self = .chatUpdate(chatId: try c.decode(String.self, forKey: .chatId))
 		case "status":
 			self = .status(try c.decode(SessionStatus.self, forKey: .status))
+		case "organizer":
+			self = .organizer
 		default:
 			self = .unknown
 		}
@@ -313,5 +391,14 @@ extension JSONDecoder {
 		let d = JSONDecoder()
 		d.keyDecodingStrategy = .convertFromSnakeCase
 		return d
+	}()
+}
+
+extension JSONEncoder {
+	/// For bodies built from the camelCase models above.
+	static let api: JSONEncoder = {
+		let e = JSONEncoder()
+		e.keyEncodingStrategy = .convertToSnakeCase
+		return e
 	}()
 }

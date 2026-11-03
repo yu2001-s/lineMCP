@@ -103,6 +103,12 @@ final class LineAPI: Sendable {
 		return sent.messageId
 	}
 
+	/// How far each other member has read; asking sends no read receipt.
+	func reads(chatId: String) async throws -> [String: String] {
+		let markers: ReadMarkers = try await get("api/chats/\(chatId)/reads")
+		return markers.readers
+	}
+
 	func markRead(chatId: String, messageId: String) async throws {
 		let _: Empty = try await post("api/chats/\(chatId)/read", json: ["message_id": messageId])
 	}
@@ -156,6 +162,29 @@ final class LineAPI: Sendable {
 		req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 		let results: SyncResults = try await send(req)
 		return results.results
+	}
+
+	func organizer() async throws -> OrganizerState {
+		try await get("api/organizer")
+	}
+
+	/// Saves groups and hidden chats. `baseRev` is the server revision whose
+	/// agent changes they include; the server adds later ones on top.
+	@discardableResult
+	func saveOrganizer(_ state: OrganizerState, baseRev: Int) async throws -> OrganizerState {
+		var req = request("PUT", "api/organizer")
+		req.httpBody = try JSONEncoder.api.encode(OrganizerSave(folders: state.folders, hidden: state.hidden, baseRev: baseRev))
+		req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+		return try await send(req)
+	}
+
+	/// Applies tag changes in order, all or none, and returns the server's copy after them.
+	func changeTags(_ ops: [TagOp]) async throws -> OrganizerState {
+		struct Body: Encodable { var ops: [TagOp] }
+		var req = request("POST", "api/organizer/tags")
+		req.httpBody = try JSONEncoder.api.encode(Body(ops: ops))
+		req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+		return try await send(req)
 	}
 
 	/// The raw event stream; `EventStream` parses it.

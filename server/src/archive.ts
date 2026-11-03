@@ -167,7 +167,8 @@ export class Archive {
 	save(chatId: string, name: string, messages: ArchivableMessage[], mode: Mode): number {
 		const count = this.#db.prepare("SELECT count(*) AS n FROM messages WHERE chat_id = ?");
 		// An existing row only takes the new text when it repairs a failed
-		// decryption; rows from before the desktop client also gain data/media_ref.
+		// decryption or an unnamed file, or the sender edited the message;
+		// rows from before the desktop client also gain data/media_ref.
 		const insert = this.#db.prepare(`
 			INSERT INTO messages (id, chat_id, created_ms, from_id, from_name, text, reply_to, decrypt_failed, search_text, data, media_ref)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -276,13 +277,20 @@ export class Archive {
 		return { removed, deletedMessages: deleted };
 	}
 
-	search(query: string, opts: { chatId?: string; limit: number }) {
+	/** `exclude`: chat ids to leave out (chats the owner hid). */
+	/** `only` limits the search to those chats, `exclude` leaves chats out. */
+	search(query: string, opts: { chatId?: string; limit: number; only?: string[]; exclude?: string[] }) {
+		const only = opts.only ? JSON.stringify(opts.only) : null;
 		const rows = this.#db.prepare(`
 			SELECT m.id, m.chat_id, m.created_ms, m.from_name, m.text, m.reply_to, c.name AS chat_name
 			FROM messages m LEFT JOIN chats c ON c.chat_id = m.chat_id
 			WHERE instr(m.search_text, ?) > 0 AND (? IS NULL OR m.chat_id = ?)
+				AND (? IS NULL OR m.chat_id IN (SELECT value FROM json_each(?)))
+				AND m.chat_id NOT IN (SELECT value FROM json_each(?))
 			ORDER BY m.created_ms DESC LIMIT ?
-		`).all(foldForSearch(query), opts.chatId ?? null, opts.chatId ?? null, opts.limit) as unknown as MessageRow[];
+		`).all(
+			foldForSearch(query), opts.chatId ?? null, opts.chatId ?? null, only, only, JSON.stringify(opts.exclude ?? []), opts.limit,
+		) as unknown as MessageRow[];
 		return rows.map((r) => ({ chat_id: r.chat_id, chat_name: r.chat_name, ...formatRow(r) }));
 	}
 
@@ -323,7 +331,11 @@ export class Archive {
 	}
 }
 
-const REPAIRS = "messages.decrypt_failed = 1 AND excluded.decrypt_failed = 0";
+// Also encrypted files saved before their names were decrypted on read, and
+// messages the sender edited after they were saved.
+const REPAIRS = "((messages.decrypt_failed = 1 AND excluded.decrypt_failed = 0) OR " +
+	"(messages.text LIKE '[file: unnamed%' AND excluded.text NOT LIKE '[file: unnamed%') OR " +
+	"(json_extract(excluded.data, '$.edited') = 1 AND excluded.decrypt_failed = 0 AND excluded.text <> messages.text))";
 
 /** Rows archived before the desktop client existed have no data; rebuild a text message. */
 function clientMessage(r: MessageRow): ClientMessage {
@@ -368,12 +380,12 @@ export class ArchiveSync {
 	constructor(line: LineService, archive: Archive) {
 		this.#line = line;
 		this.#archive = archive;
-		// Live updates between daily syncs: keep new messages, drop unsent ones.
+		// Live updates between daily syncs: keep new messages and edits, drop unsent ones.
 		line.events.on("event", (event) => {
 			try {
 				if (event.type === "unsend") {
 					archive.deleteMessage(event.message_id);
-				} else if (event.type === "message" && archive.isArchived(event.chat_id)) {
+				} else if ((event.type === "message" || event.type === "edit") && archive.isArchived(event.chat_id)) {
 					const m = event.message;
 					archive.save(event.chat_id, archive.chatName(event.chat_id) ?? event.chat_id, [{
 						id: m.id,

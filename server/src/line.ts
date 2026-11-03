@@ -2,6 +2,7 @@ import { appendFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { BaseClient } from "@jsr/evex__linejs/base";
 import { AUTH_TOKEN_KEY, config } from "./config.ts";
+import { formatSize, mediaType } from "./mediatools.ts";
 import type { AtomicFileStorage } from "./storage.ts";
 import { foldForSearch } from "./text.ts";
 
@@ -21,9 +22,18 @@ export interface FormattedMessage {
 	id: string;
 	time: string;
 	from: string;
-	from_id: string;
+	/** Only on messages from others in groups and rooms, where it tells senders apart. */
+	from_id?: string;
 	text: string;
 	reply_to?: string;
+	/** What line_send_sticker needs to send the same sticker. */
+	sticker?: { package_id: string; sticker_id: string; version: string };
+	reactions?: { type: string; from: string }[];
+	/** The sender unsent it; LINE keeps no text for it. */
+	unsent?: true;
+	/** The sender edited it (a LYP Premium feature); `text` is the edited version. */
+	edited?: true;
+	edited_at?: string;
 }
 
 export interface ArchivableMessage {
@@ -64,6 +74,8 @@ export interface ClientMessage {
 	location?: { title?: string; address?: string; latitude?: number; longitude?: number };
 	reactions?: { type: string; from_id: string }[];
 	decrypt_failed?: boolean;
+	edited?: true;
+	edited_ms?: number;
 }
 
 export interface ClientChat {
@@ -78,14 +90,27 @@ export interface ClientChat {
 
 export type LineEvent =
 	| { type: "message"; chat_id: string; message: ClientMessage }
+	/** The sender edited a message; `message` is the edited version. */
+	| { type: "edit"; chat_id: string; message: ClientMessage }
 	| { type: "unsend"; chat_id: string; message_id: string }
 	| { type: "read"; chat_id: string; reader_id: string; message_id: string }
 	| { type: "chat_read"; chat_id: string; message_id: string }
 	| { type: "reaction"; chat_id: string; message_id?: string }
 	| { type: "chat_update"; chat_id: string }
+	/** The desktop app saved new folders or hidden chats. */
+	| { type: "organizer" }
 	| { type: "status"; status: LineStatus };
 
 export type MediaKind = "image" | "video" | "audio" | "file";
+
+/** A message's photo, video, voice message or file, decrypted. */
+export interface MediaFile {
+	data: Uint8Array;
+	type: string;
+	name: string;
+	kind: MediaKind;
+	durationMs?: number;
+}
 
 export const REACTIONS = ["NICE", "LOVE", "FUN", "AMAZING", "SAD", "OMG"] as const;
 export type ReactionName = typeof REACTIONS[number] | "UNDO";
@@ -116,6 +141,7 @@ const COLLECT_PAGE_DELAY_MS = 300;
 const UNDECRYPTABLE = "[encrypted message that could not be decrypted]";
 const RAW_CACHE_SIZE = 5_000;
 const LISTEN_RETRY_MS = 5_000;
+const START_RETRY_MS = 30_000;
 const PROFILE_CDN = "https://profile.line-scdn.net";
 const STICKER_CDN = "https://stickershop.line-scdn.net/stickershop/v1/sticker";
 const MEDIA_KINDS = new Set(["image", "video", "audio", "file"]);
@@ -164,6 +190,7 @@ export class LineService {
 	lastError?: string;
 	#storage: AtomicFileStorage;
 	#lastStartAttempt = 0;
+	#startRetry?: ReturnType<typeof setTimeout>;
 	#names = new Map<string, string>();
 	#directory?: { at: number; friends: Contact[]; groups: Contact[] };
 	#sendTimes: number[] = [];
@@ -171,6 +198,8 @@ export class LineService {
 	#muted = new Map<string, boolean>();
 	/** Recently seen messages, still encrypted where it matters (media keys live in chunks). */
 	#raws = new Map<string, RawMessage>();
+	/** Messages LINE told us were unsent. History keeps serving them, emptied. */
+	#unsent = new Set<string>();
 	#listening = false;
 	/** Push events for the desktop client and the archive. */
 	readonly events = new EventEmitter<{ event: [LineEvent] }>();
@@ -203,7 +232,25 @@ export class LineService {
 		} catch (e) {
 			this.status = "error";
 			this.lastError = errorMessage(e);
+			this.#scheduleStartRetry();
 		}
+	}
+
+	/**
+	 * At boot the service starts before the network is up, so the first login
+	 * fails. Retry in the background: the push stream and archive sync only run
+	 * once the session is ready, and nothing else would bring them back until a
+	 * tool call happened to arrive.
+	 */
+	#scheduleStartRetry() {
+		if (this.#startRetry) return;
+		this.#startRetry = setTimeout(async () => {
+			this.#startRetry = undefined;
+			if (this.status !== "error") return;
+			await this.start();
+			// start() moves status on; TypeScript still has it narrowed to "error".
+			if ((this.status as LineStatus) === "ready") console.log("[line] session ready after retry");
+		}, START_RETRY_MS);
 	}
 
 	async #ready(): Promise<void> {
@@ -223,9 +270,11 @@ export class LineService {
 			: undefined;
 	}
 
-	async listChats(opts: { limit: number; unreadOnly: boolean }) {
+	/** `include` picks chats before `limit` applies. */
+	async listChats(opts: { limit: number; unreadOnly: boolean; include?: (chatId: string) => boolean }) {
 		await this.#ready();
-		const messageBoxes = (await this.#messageBoxes(opts.unreadOnly)).slice(0, opts.limit);
+		const include = opts.include ?? (() => true);
+		const messageBoxes = (await this.#messageBoxes(opts.unreadOnly)).filter((box) => include(box.id)).slice(0, opts.limit);
 		const lasts = await Promise.all(
 			messageBoxes.map((box) =>
 				box.lastMessages?.[0] ? this.#decrypt(box.lastMessages[0]) : undefined
@@ -240,7 +289,7 @@ export class LineService {
 			name: this.#nameOf(box.id),
 			type: chatType(box.id),
 			unread: Number(box.unreadCount ?? 0),
-			last_message: lasts[i] ? this.#format(lasts[i]) : undefined,
+			last_message: lasts[i] ? this.#format(lasts[i], box.id) : undefined,
 		}));
 	}
 
@@ -266,6 +315,13 @@ export class LineService {
 			official: official.get(b.id),
 			members: members.get(b.id),
 		}));
+	}
+
+	/** Display names for chat ids, including chats with nothing in the last 14 days. */
+	async chatNames(ids: string[]): Promise<Map<string, string>> {
+		await this.#ready();
+		await this.#resolveNames(ids);
+		return new Map(ids.map((id) => [id, this.#nameOf(id)]));
 	}
 
 	/** Chats active within LINE's 14-day window, most recent first. */
@@ -328,12 +384,15 @@ export class LineService {
 			opts.limit,
 			opts.before ? parseCursor(opts.before) : undefined,
 		);
-		await this.#resolveNames([opts.chatId, ...messages.map((m) => m.from)]);
+		await this.#resolveNames([
+			opts.chatId,
+			...messages.flatMap((m) => [m.from, ...reactionsOf(m).map((r) => r.from_id)]),
+		]);
 		const oldest = messages[0];
 		return {
 			chat_id: opts.chatId,
 			chat_name: this.#nameOf(opts.chatId),
-			messages: messages.map((m) => this.#format(m)),
+			messages: messages.map((m) => this.#format(m, opts.chatId)),
 			older_cursor: oldest && messages.length >= opts.limit - 1
 				? `${oldest.deliveredTime}_${oldest.id}`
 				: undefined,
@@ -363,7 +422,8 @@ export class LineService {
 			};
 			await sleep(COLLECT_PAGE_DELAY_MS);
 		}
-		const raws = [...byId.values()].sort((a, b) =>
+		// Unsent messages stay out, so the archive's reconcile drops them too.
+		const raws = [...byId.values()].filter((m) => !this.#isUnsent(m)).sort((a, b) =>
 			Number(a.createdTime) - Number(b.createdTime)
 		);
 		await this.#resolveNames([chatId, ...raws.map((m) => m.from)]);
@@ -438,16 +498,19 @@ export class LineService {
 		await this.#resolveNames([chatId, ...messages.map((m) => m.from)]);
 		const oldest = messages[0];
 		return {
-			messages: messages.map((m) => this.#toClient(m, chatId)),
+			// The app removes a message when it is unsent; reloading must not bring it back empty.
+			messages: messages.filter((m) => !this.#isUnsent(m)).map((m) => this.#toClient(m, chatId)),
 			older_cursor: oldest && messages.length >= limit - 1
 				? `${oldest.deliveredTime}_${oldest.id}`
 				: undefined,
 		};
 	}
 
-	async sendSticker(chatId: string, sticker: { packageId: string; stickerId: string; version: string }) {
+	/** `agent` sends (MCP) are rate limited and logged to sent.log, like text. */
+	async sendSticker(chatId: string, sticker: { packageId: string; stickerId: string; version: string; agent?: boolean }) {
 		await this.#ready();
 		assertMid(chatId);
+		if (sticker.agent) this.#takeSendSlot();
 		// Sticker metadata is public catalogue data; LINE clients send it unencrypted.
 		const sent = await this.base.talk.sendMessage({
 			to: chatId,
@@ -455,15 +518,22 @@ export class LineService {
 			contentMetadata: { STKID: sticker.stickerId, STKPKGID: sticker.packageId, STKVER: sticker.version },
 			e2ee: false,
 		});
-		return { message_id: String(sent.id) };
+		const result = { message_id: String(sent.id) };
+		if (sticker.agent) await this.#logAgent(chatId, { ...result, sticker: `${sticker.packageId}/${sticker.stickerId}` });
+		return result;
 	}
 
-	async sendMedia(chatId: string, file: { data: Blob; kind: MediaKind; fileName: string; durationMs?: number }) {
+	/** `agent` sends (MCP) are rate limited and logged to sent.log, like text. */
+	async sendMedia(
+		chatId: string,
+		file: { data: Blob; kind: MediaKind; fileName: string; durationMs?: number; agent?: boolean },
+	) {
 		await this.#ready();
 		assertMid(chatId);
 		if (chatId.startsWith("r")) {
 			throw new Error("LINE does not accept encrypted media in legacy multi-person rooms.");
 		}
+		if (file.agent) this.#takeSendSlot();
 		const sent = await this.base.obs.uploadMediaByE2EE({
 			data: file.data,
 			oType: file.kind,
@@ -471,17 +541,66 @@ export class LineService {
 			filename: file.fileName,
 			durationMs: file.durationMs,
 		});
-		return { message_id: String(sent.id) };
+		const result = { message_id: String(sent.id) };
+		if (file.agent) {
+			await this.#resolveNames([chatId]);
+			appendFileSync(
+				config.sendLogPath,
+				JSON.stringify({
+					...result,
+					chat_id: chatId,
+					chat_name: this.#nameOf(chatId),
+					sent_at: formatTime(Date.now()),
+					media: file.kind,
+					file_name: file.fileName,
+				}) + "\n",
+				{ mode: 0o600 },
+			);
+		}
+		return result;
 	}
 
-	async unsend(messageId: string) {
+	/** `agentChatId` marks an agent (MCP) call, which is logged to sent.log. */
+	async unsend(messageId: string, agentChatId?: string) {
 		await this.#ready();
 		await this.base.talk.unsendMessage({ messageId });
+		if (agentChatId) await this.#logAgent(agentChatId, { unsent: messageId });
 	}
 
-	async react(messageId: string, reaction: ReactionName) {
+	/** `agentChatId` marks an agent (MCP) call, which is rate limited and logged like a send. */
+	async react(messageId: string, reaction: ReactionName, agentChatId?: string) {
 		await this.#ready();
+		if (agentChatId) this.#takeSendSlot();
 		await this.base.talk.react({ id: BigInt(messageId), reaction });
+		if (agentChatId) await this.#logAgent(agentChatId, { message_id: messageId, reaction });
+	}
+
+	/** The id of the newest message in a chat, for marking it read. */
+	async newestMessageId(chatId: string): Promise<string | undefined> {
+		await this.#ready();
+		assertMid(chatId);
+		return (await this.#fetchPage(chatId, 1)).at(-1)?.id?.toString();
+	}
+
+	async #logAgent(chatId: string, entry: object) {
+		await this.#resolveNames([chatId]);
+		appendFileSync(
+			config.sendLogPath,
+			JSON.stringify({ ...entry, chat_id: chatId, chat_name: this.#nameOf(chatId), sent_at: formatTime(Date.now()) }) + "\n",
+			{ mode: 0o600 },
+		);
+	}
+
+	/**
+	 * How far each other member has read in a chat: member mid → id of the
+	 * newest message they have read. Reading this sends nothing to anyone.
+	 */
+	async readMarkers(chatId: string): Promise<Record<string, string>> {
+		await this.#ready();
+		assertMid(chatId);
+		const result = await this.base.talk.getMessageReadRange({ chatIds: [chatId], syncReason: "INTERNAL" });
+		const entry = (result ?? []).find((r) => r.chatId === chatId) ?? result?.[0];
+		return latestReads(entry?.ranges ?? {}, this.base.profile?.mid);
 	}
 
 	/** The only place this server sends a read receipt: the owner asked for it. */
@@ -499,11 +618,11 @@ export class LineService {
 	 * Downloads and decrypts a message's media. `rawRef` is the archived encrypted
 	 * message for media older than LINE's 14-day window.
 	 */
-	async downloadMedia(chatId: string, messageId: string, delivered: string, rawRef?: string) {
+	async downloadMedia(chatId: string, messageId: string, delivered?: string, rawRef?: string): Promise<MediaFile> {
 		await this.#ready();
 		assertMid(chatId);
 		let raw = this.#raws.get(messageId) ?? (rawRef ? reviveRaw(rawRef) : undefined);
-		if (!raw) {
+		if (!raw && delivered) {
 			// The history call is inclusive of its end id, so this returns the message itself.
 			const found = await this.base.talk.getPreviousMessagesV2WithRequest({
 				request: {
@@ -515,15 +634,32 @@ export class LineService {
 			});
 			raw = found.find((m) => String(m.id) === messageId);
 		}
-		if (!raw) throw new Error("Message not found; LINE no longer serves it.");
+		if (!raw) {
+			throw new Error(
+				delivered
+					? "Message not found; LINE no longer serves it."
+					: "Message not found. Read the chat first (line_read_messages or line_read_archive), then retry with an id from it.",
+			);
+		}
+		const kind = kindOf(raw);
+		if (!MEDIA_KINDS.has(kind)) {
+			throw new Error(`Message ${messageId} is ${describe(raw)}, not a photo, video, voice message or file.`);
+		}
 		const file = raw.chunks?.length
 			? await this.base.obs.downloadMediaByE2EE(raw)
 			: await this.base.obs.downloadMessageData({ messageId });
 		if (!file) throw new Error("Media download failed.");
+		const meta = raw.contentMetadata ?? {};
+		// linejs sometimes names a download "undefined".
+		const usable = (name?: string) => name && !/^(undefined|null)(\.|$)/.test(name) ? name : undefined;
+		const data = new Uint8Array(await file.arrayBuffer());
+		const name = usable(file.name) ?? usable(meta.FILE_NAME) ?? messageId;
 		return {
-			data: new Uint8Array(await file.arrayBuffer()),
-			type: file.type || "application/octet-stream",
-			name: file.name || raw.contentMetadata?.FILE_NAME || messageId,
+			data,
+			type: mediaType(name, data, file.type),
+			name,
+			kind: kind as MediaKind,
+			durationMs: meta.DURATION ? Number(meta.DURATION) : undefined,
 		};
 	}
 
@@ -560,17 +696,27 @@ export class LineService {
 		const type = String(op.type);
 		switch (type) {
 			case "RECEIVE_MESSAGE":
-			case "SEND_MESSAGE": {
+			case "SEND_MESSAGE":
+			// Someone else edited a message, or the owner did on another device.
+			case "NOTIFIED_EDIT_MESSAGE":
+			case "EDIT_MESSAGE": {
+				if (!op.message) break;
 				const m = await this.#decrypt(op.message);
 				this.#remember(m);
 				const chatId = this.#chatIdOf(m);
 				await this.#resolveNames([chatId, m.from]);
-				this.events.emit("event", { type: "message", chat_id: chatId, message: this.#toClient(m, chatId) });
+				this.events.emit("event", {
+					type: type.endsWith("EDIT_MESSAGE") ? "edit" : "message",
+					chat_id: chatId,
+					message: this.#toClient(m, chatId),
+				});
 				break;
 			}
 			case "NOTIFIED_DESTROY_MESSAGE":
 			case "DESTROY_MESSAGE":
 				this.#raws.delete(op.param2);
+				this.#unsent.add(op.param2);
+				if (this.#unsent.size > RAW_CACHE_SIZE) this.#unsent.delete(this.#unsent.values().next().value!);
 				this.events.emit("event", { type: "unsend", chat_id: op.param1, message_id: op.param2 });
 				break;
 			case "NOTIFIED_READ_MESSAGE":
@@ -589,6 +735,10 @@ export class LineService {
 				this.events.emit("event", { type: "chat_update", chat_id: op.param1 });
 				break;
 		}
+	}
+
+	#isUnsent(m: RawMessage): boolean {
+		return this.#unsent.has(String(m.id)) || isUnsentStub(m);
 	}
 
 	#remember(m: RawMessage) {
@@ -651,11 +801,13 @@ export class LineService {
 				longitude: m.location.longitude,
 			};
 		}
-		const reactions = (m.reactions ?? []).map((r) => ({
-			type: String(r.reactionType?.predefinedReactionType ?? ""),
-			from_id: r.fromUserMid,
-		})).filter((r) => r.type);
+		const reactions = reactionsOf(m);
 		if (reactions.length) out.reactions = reactions;
+		if (isEdited(m)) {
+			out.edited = true;
+			const at = editedMs(m);
+			if (at) out.edited_ms = at;
+		}
 		return out;
 	}
 
@@ -731,22 +883,44 @@ export class LineService {
 
 	async #decrypt(raw: RawMessage): Promise<RawMessage> {
 		if (!raw.contentMetadata?.e2eeVersion) return raw;
+		let m: RawMessage;
 		try {
-			return await this.base.e2ee.decryptE2EEMessage(raw);
+			m = await this.base.e2ee.decryptE2EEMessage(raw);
 		} catch {
 			return { ...raw, text: UNDECRYPTABLE };
 		}
+		// An encrypted file's name is in its payload, which linejs only opens to download it.
+		if (kindOf(m) === "file" && !m.contentMetadata?.FILE_NAME && m.chunks?.length) {
+			try {
+				const { fileName } = await this.base.e2ee.decryptE2EEDataMessage(m);
+				if (typeof fileName === "string" && fileName) {
+					m = { ...m, contentMetadata: { ...m.contentMetadata, FILE_NAME: fileName } };
+				}
+			} catch { /* the name is cosmetic; the download decrypts on its own */ }
+		}
+		return m;
 	}
 
-	#format(m: RawMessage): FormattedMessage {
+	#format(m: RawMessage, chatId: string): FormattedMessage {
 		const mine = m.from === this.base.profile?.mid;
+		const meta = m.contentMetadata ?? {};
+		const reactions = reactionsOf(m).map((r) => ({ type: r.type, from: this.#nameOf(r.from_id) }));
+		const unsent = this.#isUnsent(m);
+		const editedAt = editedMs(m);
 		return {
 			id: String(m.id),
 			time: formatTime(Number(m.createdTime)),
 			from: mine ? "me" : this.#nameOf(m.from),
-			from_id: m.from,
-			text: describe(m),
+			// In a 1:1 chat the other person's id is the chat id.
+			...(mine || m.from === chatId ? {} : { from_id: m.from }),
+			text: unsent ? "[unsent]" : describe(m),
 			...(m.relatedMessageId ? { reply_to: String(m.relatedMessageId) } : {}),
+			...(kindOf(m) === "sticker" && meta.STKID
+				? { sticker: { package_id: meta.STKPKGID, sticker_id: meta.STKID, version: meta.STKVER ?? "1" } }
+				: {}),
+			...(reactions.length ? { reactions } : {}),
+			...(unsent ? { unsent: true } : {}),
+			...(!unsent && isEdited(m) ? { edited: true, ...(editedAt ? { edited_at: formatTime(editedAt) } : {}) } : {}),
 		};
 	}
 
@@ -816,6 +990,31 @@ export class LineService {
 		for (const [mid, name] of names) this.#names.set(mid, name);
 		return names;
 	}
+}
+
+/**
+ * From LINE's read ranges (member → ranges of message ids they have read), the
+ * newest message id each member has read, leaving out the owner.
+ *
+ * linejs leaves this struct undecoded: a member's ranges arrive as an object
+ * keyed "0", "1", … and each range by field number, "2" being endMessageId.
+ */
+export function latestReads(ranges: Record<string, unknown>, ownMid?: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [mid, value] of Object.entries(ranges)) {
+		if (mid === ownMid || !value || typeof value !== "object") continue;
+		const entries = Array.isArray(value) ? value : Object.values(value);
+		let newest: bigint | undefined;
+		for (const entry of entries) {
+			const range = entry as { endMessageId?: unknown; 2?: unknown } | undefined;
+			const end = range?.endMessageId ?? range?.[2];
+			if (end === undefined || end === null) continue;
+			const id = BigInt(String(end));
+			if (newest === undefined || id > newest) newest = id;
+		}
+		if (newest !== undefined && newest > 0n) out[mid] = String(newest);
+	}
+	return out;
 }
 
 function chunks<T>(items: T[], size: number): T[][] {
@@ -894,6 +1093,13 @@ function reviveRaw(json: string): RawMessage {
 	return r as RawMessage;
 }
 
+function reactionsOf(m: RawMessage): { type: string; from_id: string }[] {
+	return (m.reactions ?? []).map((r) => ({
+		type: String(r.reactionType?.predefinedReactionType ?? ""),
+		from_id: r.fromUserMid,
+	})).filter((r) => r.type);
+}
+
 function reactionMessageId(param: string): string | undefined {
 	try {
 		const parsed = JSON.parse(param);
@@ -901,6 +1107,29 @@ function reactionMessageId(param: string): string | undefined {
 	} catch {
 		return /^\d+$/.test(param) ? param : undefined;
 	}
+}
+
+/**
+ * LINE keeps serving an unsent message in history, emptied: a text message
+ * with neither text nor encrypted chunks. Nothing a person sends looks like that.
+ */
+function isUnsentStub(m: RawMessage): boolean {
+	return contentTypeName(m) === "NONE" && !m.text && !m.chunks?.length;
+}
+
+/**
+ * When the sender last edited the message. Only text can be edited. Edit
+ * pushes set `EDITED` and `UPDATED_TIME`; messages read from history carry
+ * only `UPDATED_TIME`, which photos have too without being edited.
+ */
+function editedMs(m: RawMessage): number | undefined {
+	if (contentTypeName(m) !== "NONE") return undefined;
+	const at = Number(m.contentMetadata?.UPDATED_TIME);
+	return at > Number(m.createdTime) ? at : undefined;
+}
+
+function isEdited(m: RawMessage): boolean {
+	return m.contentMetadata?.EDITED === "true" || editedMs(m) !== undefined;
 }
 
 function describe(m: RawMessage): string {
@@ -919,7 +1148,7 @@ function describe(m: RawMessage): string {
 		case "AUDIO":
 			return "[voice message]";
 		case "FILE":
-			return `[file: ${meta.FILE_NAME ?? "unnamed"}]`;
+			return `[file: ${meta.FILE_NAME ?? "unnamed"}${Number(meta.FILE_SIZE) > 0 ? `, ${formatSize(Number(meta.FILE_SIZE))}` : ""}]`;
 		case "CONTACT":
 			return `[contact card: ${meta.displayName ?? ""}]`;
 		case "LOCATION":
@@ -938,7 +1167,7 @@ function lastActivity(box: { lastMessages?: RawMessage[]; lastDeliveredMessageId
 	return Number(box.lastMessages?.[0]?.createdTime ?? box.lastDeliveredMessageId?.deliveredTime ?? 0);
 }
 
-function chatType(mid: string): Contact["type"] {
+export function chatType(mid: string): Contact["type"] {
 	return mid.startsWith("c") ? "group" : mid.startsWith("r") ? "room" : "user";
 }
 

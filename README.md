@@ -23,6 +23,7 @@ Replace these placeholders with your own values:
 |---|---|---|
 | `worker/wrangler.jsonc` | `YOUR_KV_NAMESPACE_ID`, `YOUR_VPC_SERVICE_ID` | Your KV namespace and the Workers VPC service for your tunnel |
 | `worker/src/index.ts` | `line-mcp.your-subdomain.workers.dev` | Your Worker's URL |
+| `server/src/config.ts` | `line-mcp.your-subdomain.workers.dev` | Your Worker's URL, where agents upload files (or set `LINE_MCP_PUBLIC_URL` in the server's env) |
 | `desktop/project.yml` | `your-tailnet.ts.net` | Your tailnet's MagicDNS domain (`tailscale status --json`, `MagicDNSSuffix`) |
 | `desktop/project.yml` | `com.example` | Your bundle id prefix |
 | `desktop/betterLINE/Store/Preferences.swift` | `linebox.your-tailnet.ts.net` | Default server address shown on first launch |
@@ -34,19 +35,50 @@ The commands below use `linebox` as the SSH alias of the machine running the ser
 | Tool | Notes |
 |---|---|
 | `line_get_status` | Session state and account |
-| `line_list_chats` | Recent chats with unread counts and last message |
-| `line_read_messages` | Chronological history with paging (`older_cursor`). LINE only serves the last 14 days to a secondary device |
+| `line_list_chats` | Recent chats with unread counts, last message, betterLINE folder and tags. `folder` limits it to one folder, `tags` to chats with any (or with `match_all_tags`, all) of those tags |
+| `line_list_folders` | The owner's betterLINE folders (群組) with every chat in each, including chats quiet for over 14 days |
+| `line_list_tags` | The tags on the owner's chats (e.g. a company, Acme) with every chat that has each, including chats quiet for over 14 days |
+| `line_tag_add` / `line_tag_remove` | Add or remove tags on one or more chats. A name matching an existing tag (ignoring case and Simplified/Traditional Chinese) is that tag |
+| `line_tag_rename` / `line_tag_delete` | Rename a tag on every chat (renaming onto another tag merges them), or take it off every chat, as Settings → 聊天室 does |
+| `line_folder_move` | Move chats into a folder (`create_folder` makes it), or out of their folder with `folder: null` |
+| `line_folder_edit` / `line_folder_delete` | Create, rename or reorder a folder; delete one (its chats go back to the main list) |
+| `line_hide_chats` | Hide chats (隱藏聊天室). They then leave every tool too, so only the owner can unhide them, in betterLINE |
+| `line_read_messages` | Chronological history with paging (`older_cursor`). LINE only serves the last 14 days to a secondary device. Stickers carry the ids `line_send_sticker` needs, and messages list their reactions. Unsent messages come back as `unsent: true` with no text, since LINE keeps none; edited ones (a LYP Premium feature) as `edited: true` with `edited_at` and the edited text |
 | `line_search_contacts` | Friends and groups by name |
 | `line_send_message` | E2EE text message. Limited to one send every 3 s and 20 every 10 min |
+| `line_send_sticker` | A sticker seen in a chat. Shares the send limit and `sent.log` |
+| `line_react` / `line_unsend` | React to a message (or `UNDO`), unsend one of the owner's own messages. Reactions share the send limit; both are logged to `sent.log` |
+| `line_mark_read` | Mark a chat read up to its newest message (or a given one): sends LINE's read receipt, as opening it on the phone does |
+| `line_read_receipts` | How far each other member has read; checking sends nothing |
+| `line_get_media` | Opens a photo, video, voice message or file from a message Claude has read: photos come back as an image (at most 1568 px), text files as text, anything else (PDF, Excel, zip, video, …) whole as an embedded file up to 20 MB, which Claude Code saves to a local file |
+| `line_forward_media` | Sends a photo, video, voice message or file from one chat to another, E2EE. Shares the send limit and `sent.log` |
+| `line_create_upload` | A one-time URL to `PUT` a local file (up to 100 MB) to, for `line_send_file`. See [Uploads](#uploads) |
+| `line_send_file` | Sends a text file Claude wrote (.txt .md .csv .json …) or an uploaded file, E2EE. Uploaded .jpg .png .gif go as a photo and .mp4 .mov .m4v as a video unless `as_file`; anything else as a file. Shares the send limit and `sent.log` |
 | `line_archive_add` / `line_archive_remove` | Start or stop keeping a local copy of a chat. Removing keeps its messages unless `delete_messages` is set |
 | `line_archive_list` | Archived chats, message counts, date range, last sync |
 | `line_archive_rules` | The auto-archive rules, and for every chat active in the last 14 days whether it is archived, matches, or is skipped and why |
 | `line_archive_configure` | Turn auto-archive on or off, or change the group-size limit and official-account filter |
 | `line_archive_sync` | Sync archived chats now instead of waiting for the daily run |
 | `line_read_archive` | Read an archived chat from the local copy, including messages older than 14 days |
-| `line_search_messages` | Substring search over archived chats (works for Chinese) |
+| `line_search_messages` | Substring search over archived chats (works for Chinese); `tags` limits it to chats with those tags |
+| `line_listen_set` / `line_listen_remove` | Register or remove a webhook for one or more chats; every new message from someone else in them is POSTed to it |
+| `line_listen_list` | Registered listeners, their webhooks and chats |
 
 Reading does **not** mark chats as read and sends no read receipts.
+
+Chats hidden in betterLINE (隱藏聊天室) are left out of every listing and search, and every tool that takes a chat id refuses them. A tag that only hidden chats have is not listed either.
+
+Agents can do what the owner does in betterLINE except unhide a chat, which would mean showing them the chats the owner hid from them. The server instructions and tool descriptions tell agents to organise chats, react, unsend or mark read only when the owner asks.
+
+## Folders
+
+Folders (the app's 群組) and hidden chats are the desktop app's: each Mac saves its whole copy with `PUT /api/organizer`. Agents change them one small operation at a time (create, rename, move in the sidebar, delete, move chats, hide), which the server applies at once and also keeps, with the revision each made, in `organizer.json` (the last 1,000). A Mac's save says which revision its copy is based on (`base_rev`), and the server replays every agent change after it on top, so a Mac that was offline or mid-edit does not undo what an agent did; a change to a folder the Mac deleted meanwhile does nothing, and a folder an agent made merges into one of the same name the Mac made. The reply is the result, which the Mac takes as its own. Builds of betterLINE older than this send no `base_rev`, and their saves overwrite agents' changes as before.
+
+## Tags
+
+A chat can have any number of tags, such as the company a contact works at. The owner adds and removes them in betterLINE, and agents with `line_tag_add` / `line_tag_remove`; the server instructions tell agents that tags are the owner's organisation, to change them only when the owner asks, and never to take a tag name from a LINE message.
+
+Tags live on the server (`organizer.json`, next to folders and hidden chats), which is the only copy both sides write. They change only through small operations — add these tags to these chats, remove them, rename a tag, delete a tag — applied one after another, so an agent's change and the desktop's change to different chats or tags both survive. The desktop's save of its folders and hidden chats (`PUT /api/organizer`) never carries tags and leaves them alone. Every change bumps a revision number and sends an `organizer` event, so open betterLINE windows show an agent's tags right away.
 
 ## Archive
 
@@ -55,6 +87,25 @@ LINE serves exactly the last 14 days of history to a secondary device; older mes
 Auto-archive picks chats by rule: 1:1 chats with real people and groups of up to 10 members, never LINE official accounts (`userType = BOT`). The daily sync also adds chats that newly match. Manual adds win over the rules, and a chat removed by hand is never re-added by them.
 
 The scheduler checks hourly and runs when the last full sync is over 24 h old, so an outage of up to two weeks catches up by itself.
+
+## Uploads
+
+Agents send files they have locally (a PDF, a photo) in two steps: `line_create_upload` returns `https://line-mcp…workers.dev/upload/<id>`, the agent `PUT`s the bytes there (`curl -T file '<url>'`), and passes the id to `line_send_file`. The URL needs no OAuth token: the id is 32 random characters handed out over the authorized connector, and it takes one file. The Worker streams the body to the server through Workers VPC, which keeps it owner-only in `~/.local/state/line-mcp/uploads` for an hour (so one file can go to several chats) and clears the folder on restart. Files over 100 MB are refused.
+
+## Listeners
+
+An agent registers a webhook for one or more chats with `line_listen_set`. Every new message someone else sends in those chats is POSTed to the webhook as JSON:
+
+```json
+{
+  "text": "New LINE message in c… from Amy: lunch at noon?",
+  "listener": "monitor",
+  "chat_id": "c…",
+  "message": { "id": "…", "from_id": "u…", "from_name": "Amy", "kind": "text", "text": "lunch at noon?", "time": "2026-10-12 16:40" }
+}
+```
+
+`headers` are sent with each POST (for example `Authorization`). The owner's own messages are not posted, so an agent's replies don't call its webhook. A failed POST (10 s timeout) is logged and not retried. Listeners are kept in `~/.local/state/line-mcp/listeners.json`.
 
 ## Desktop client API
 
@@ -66,10 +117,13 @@ The scheduler checks hourly and runs when the last full sync is over 24 h old, s
 | `GET /api/contacts?q=` | Friends and groups, including ones with no messages in the last 14 days; Simplified and Traditional Chinese match |
 | `GET /api/chats/:id/messages?before=` | History: LINE's 14 days (`l:` cursors), then the archive (`a:` cursors) for archived chats |
 | `POST /api/chats/:id/messages`, `/sticker`, `/media?kind=&name=` | Send text, a sticker, or an E2EE image/video/audio/file |
+| `GET /api/chats/:id/reads` | How far each other member has read (newest message id per member); asking sends no read receipt |
 | `POST /api/chats/:id/read`, `/api/messages/:id/unsend`, `/api/messages/:id/react` | Mark read, unsend, react |
 | `GET /api/media/:id?chat=&delivered=` | Decrypted media, cached owner-only in `~/.local/state/line-mcp/media-cache` (2 GB cap) |
 | `GET /api/search?q=`, `GET /api/archive`, `POST /api/archive/sync` | Archive search and status |
-| `GET /api/events` | Server-sent events: new messages, unsends, reads, reactions, session status |
+| `GET /api/organizer`, `PUT /api/organizer` | Folders, hidden chats and tags, kept in `~/.local/state/line-mcp/organizer.json` for the MCP tools. The PUT replaces folders and hidden chats only, then replays agents' folder changes made after its `base_rev` (see [Folders](#folders)) |
+| `POST /api/organizer/tags` | Tag changes `{ops: [{op: "add" \| "remove", tags, chat_ids} \| {op: "rename", tags: [old], to} \| {op: "delete", tags: [old]}]}`, applied in order, all or none |
+| `GET /api/events` | Server-sent events: new messages, unsends, reads, reactions, session status, organizer changes (including tags set by agents) |
 
 To turn it off, remove `LINE_CLIENT_HOST`/`LINE_CLIENT_KEY` from the env file and `systemctl --user restart line-mcp`.
 
@@ -78,8 +132,11 @@ To turn it off, remove `LINE_CLIENT_HOST`/`LINE_CLIENT_KEY` from the env file an
 `desktop/` is a SwiftUI app (macOS 15+) for reading and writing LINE from the Mac over this API, laid out like Messages and in Traditional Chinese: chat list with unread badges, history that continues into the archive, text with replies, stickers seen in your chats, E2EE images/video/voice/files (drop, paste or attach), reactions, unsend, archive search with Simplified/Traditional folding, live updates, and notifications you can reply to.
 
 - **New chat (⌘N)** opens the address book: every friend and group, including ones with no messages in LINE's 14 days. The sidebar search lists matching contacts too.
-- **Groups**: right-click a chat → 移到群組 to file it under a collapsible sidebar section. Groups are kept on this Mac only.
-- **Hidden chats**: right-click → 隱藏聊天室. A hidden chat leaves the list and search, stops counting toward the Dock badge and never notifies; Settings → 聊天室 opens or unhides it.
+- **Groups**: right-click a chat → 移到群組 to file it under a collapsible sidebar section. Claude sees them as folders (`line_list_folders`) and files chats too (`line_folder_move`).
+- **Hidden chats**: right-click → 隱藏聊天室. A hidden chat leaves the list and search, stops counting toward the Dock badge and never notifies; Settings → 聊天室 opens or unhides it. The MCP tools leave it alone too.
+- **Tags**: right-click a chat → 標籤 to tick existing tags or add a new one; a chat can have several, shown under its last message. The filter button above the list shows only chats with any (or all) of the chosen tags. Settings → 聊天室 renames or deletes a tag on every chat. Claude reads and changes the same tags (`line_list_tags`, `line_tag_add`).
+- Groups and hidden chats are saved on the server, so every Mac and the MCP tools share them. The first time a Mac connects, its groups merge with the server's by name; after that the server's copy wins, except for changes made while offline, and agents' changes are added back on top of those. Which groups are collapsed stays per Mac.
+- Tags are the server's: each Mac shows the server's copy with its own unconfirmed changes on top. A change made offline is queued (it survives quitting) and sent in order on the next connect, on top of whatever agents changed meanwhile.
 - **Trackpad swipes**, as in Messages: two fingers left show every message's time; two fingers right on a bubble start a reply to it.
 - **Attachments**: paste (⌘V) a screenshot, a copied image or copied files, drop files or images on the window, or use **+** → 照片與檔案…
 
@@ -88,7 +145,7 @@ To turn it off, remove `LINE_CLIENT_HOST`/`LINE_CLIENT_KEY` from the env file an
 - Opening a chat sends LINE's read receipt, as the phone does. Turn that off in Settings → 一般 and use ⇧⌘R to mark a chat read by hand.
 - Decrypted media is cached owner-only in `~/Library/Caches/<bundle id>` (2 GB cap, Settings → 一般 → 清除).
 - Closing the window keeps the app running for notifications and the Dock badge; ⌘Q quits.
-- The app ships without an icon. To add one, put an Icon Composer file at `desktop/betterLINE/Resources/AppIcon.icon` and set `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon` in `project.yml`.
+- The icon (`desktop/betterLINE/Resources/AppIcon.icon`, an Icon Composer file) is a chat bubble drawn as one continuous line, so it follows the system's dark, tinted and clear icon styles.
 
 Build and install (needs Xcode and `brew install xcodegen`):
 
@@ -109,16 +166,16 @@ Run the client tests with `cd desktop && xcodebuild -project betterLINE.xcodepro
 - linejs registers a fresh E2EE key pair when a login cannot transfer the account's keys, which breaks decryption on the primary phone. `createBaseClient` disables that, so a bad login fails instead.
 - The server listens on 127.0.0.1 only and requires the `x-line-mcp-key` shared secret. It has no public hostname: the Worker reaches it through Workers VPC.
 - `~/.local/state/line-mcp/storage.json` holds the session token and E2EE private keys (mode 600, atomic writes). Treat it like a password.
-- Every sent message is logged in `~/.local/state/line-mcp/sent.log`.
+- Every message Claude sends, text or media, is logged in `~/.local/state/line-mcp/sent.log`.
 - Only chats the owner archives are stored; everything else is fetched live and never written to disk.
-- Unsent messages are removed from the archive: immediately from the push event, and again by the daily sync, which drops anything LINE no longer serves inside its 14-day window.
+- Unsent messages are removed from the archive: immediately from the push event, and again by the daily sync, which drops anything LINE no longer serves inside its 14-day window. LINE keeps serving an unsent message as an empty text message; the sync leaves those out too. Edited messages take their new text, from the push event or the daily sync.
 - Only agent (MCP) sends are rate limited and logged to `sent.log`. Text goes out end-to-end encrypted; it falls back to unencrypted only for LINE official accounts, which have no E2EE keys.
 
 ## Where things live
 
 | What | Where |
 |---|---|
-| Server code | `~/lineMCP/server` on the server (deployed from `server/` here with rsync) |
+| Server code | `~/lineMCP` on the server, a clone of this repo on `main`; the service runs from `server/` |
 | Services | `systemctl --user {status,restart} line-mcp line-mcp-tunnel` (units in `server/deploy/`) |
 | Logs | `journalctl --user -u line-mcp -f` |
 | Backend secret, tunnel token | `~/.config/line-mcp/{env,tunnel-token}` on the server |
@@ -136,10 +193,10 @@ security find-generic-password -s "LINE MCP owner passphrase" -w | pbcopy
 
 **Run tests**: `cd server && npm test`
 
-**Deploy server changes**
+**Deploy server changes**: push to `main`, then pull on the server. The server only pulls; never edit code there.
 
 ```bash
-rsync -az --exclude node_modules server/ linebox:lineMCP/server/ && ssh linebox 'cd ~/lineMCP/server && npm ci --omit=dev && systemctl --user restart line-mcp'
+ssh linebox 'cd ~/lineMCP && git pull --ff-only && cd server && npm ci --omit=dev && systemctl --user restart line-mcp'
 ```
 
 **Log in** (first setup, after LINE signs the device out, or when `line_get_status` reports `logged_out`). Scan the QR code with the phone, then enter the PIN it shows:

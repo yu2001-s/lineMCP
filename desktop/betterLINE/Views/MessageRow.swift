@@ -286,7 +286,8 @@ private struct MessageContent: View {
 	}
 }
 
-/// Text with clickable links. Message text is never interpreted as Markdown.
+/// Text with clickable links that can be selected and copied. Message text is
+/// never interpreted as Markdown.
 private struct LinkedText: View {
 	let text: String
 	/// On your own (accent-coloured) bubble, links stay white and underlined.
@@ -299,6 +300,7 @@ private struct LinkedText: View {
 			.font(.system(size: 14))
 			.fixedSize(horizontal: false, vertical: true)
 			.tint(onAccent ? .white : .accentColor)
+			.textSelection(.enabled)
 	}
 
 	private var attributed: AttributedString {

@@ -24,9 +24,9 @@ final class Conversation {
 	/// The oldest unread message when the chat was opened, for the "new messages" divider.
 	private(set) var firstUnreadId: String?
 
-	/// readerId → time of the newest message they have read. LINE only reports
-	/// reads live, so this covers what happened while the app was running.
-	private(set) var readers: [String: Int64] = [:]
+	/// readerId → id of the newest message they have read: fetched from LINE when
+	/// the chat opens or refreshes, then kept current by live read events.
+	private(set) var readers: [String: String] = [:]
 
 	@ObservationIgnored private unowned let app: AppModel
 	@ObservationIgnored private var sendChain: Task<Void, Never>?
@@ -60,6 +60,16 @@ final class Conversation {
 		} catch {
 			self.error = error.userMessage
 		}
+		Task { await refreshReads() }
+	}
+
+	/// Asks LINE how far everyone has read. Markers only ever move forward, so a
+	/// live event that arrived meanwhile is never undone.
+	func refreshReads() async {
+		guard let api = app.api, let markers = try? await api.reads(chatId: chatId) else { return }
+		for (reader, messageId) in markers {
+			noteRead(readerId: reader, messageId: messageId)
+		}
 	}
 
 	func loadOlder(limit: Int = 50) async {
@@ -84,6 +94,7 @@ final class Conversation {
 		let started = Self.nowMs
 		guard let page = try? await api.messages(chatId: chatId) else { return }
 		merge(page.messages)
+		Task { await refreshReads() }
 		if let oldest = page.messages.first?.timeMs {
 			let served = Set(page.messages.map(\.id))
 			messages.removeAll { !$0.isLocal && $0.timeMs >= oldest && $0.timeMs < started && !served.contains($0.id) }
@@ -155,13 +166,14 @@ final class Conversation {
 	}
 
 	func noteRead(readerId: String, messageId: String) {
-		let time = message(messageId)?.timeMs ?? Self.nowMs
-		readers[readerId] = max(readers[readerId] ?? 0, time)
+		if let current = readers[readerId], MessageOrder.id(current, isAtLeast: messageId) { return }
+		readers[readerId] = messageId
 	}
 
 	/// How many people have read up to this message.
 	func readCount(_ message: Message) -> Int {
-		readers.values.reduce(0) { $1 >= message.timeMs ? $0 + 1 : $0 }
+		guard !message.isLocal else { return 0 }
+		return readers.values.reduce(0) { MessageOrder.id($1, isAtLeast: message.id) ? $0 + 1 : $0 }
 	}
 
 	// MARK: Sending

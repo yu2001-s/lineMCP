@@ -60,5 +60,6 @@ private struct MainView: View {
 			NewChatSheet()
 		}
 		.groupPrompt(app)
+		.tagPrompt(app)
 	}
 }

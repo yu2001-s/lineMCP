@@ -26,6 +26,10 @@ interface Env {
 }
 
 const BACKEND_URL = "http://127.0.0.1:8790/mcp";
+const BACKEND_ORIGIN = "http://127.0.0.1:8790";
+// An agent's line_create_upload URL. The id is a one-time secret the backend
+// handed out over authorized MCP, so the URL needs no OAuth token: curl -T works.
+const UPLOAD_PATH = /^\/upload\/[A-Za-z0-9_-]{32}$/;
 const MAX_FAILED_LOGINS_PER_HOUR = 10;
 // Headers an MCP client legitimately sends; everything else (notably the
 // OAuth bearer token) stays at the edge.
@@ -74,6 +78,7 @@ const authHandler = {
 				headers: { "content-type": "text/plain; charset=utf-8" },
 			});
 		}
+		if (UPLOAD_PATH.test(url.pathname)) return uploadProxy(request, env, url.pathname);
 		if (url.pathname !== "/authorize") return new Response("Not Found", { status: 404 });
 
 		const oauth = env.OAUTH_PROVIDER;
@@ -137,6 +142,28 @@ export default new OAuthProvider<Env>({
 		resource_name: "LINE (personal account)",
 	},
 });
+
+/** Streams a file PUT to an upload URL through to the backend, which checks the id. */
+async function uploadProxy(request: Request, env: Env, path: string): Promise<Response> {
+	if (request.method !== "PUT") {
+		return Response.json({ error: "PUT the file's bytes, e.g. curl -T <path> '<url>'" }, { status: 405, headers: { Allow: "PUT" } });
+	}
+	let upstream: Response;
+	try {
+		upstream = await env.LINE_BACKEND.fetch(`${BACKEND_ORIGIN}${path}`, {
+			method: "PUT",
+			headers: { "x-line-mcp-key": env.BACKEND_KEY },
+			body: request.body,
+		});
+	} catch (e) {
+		console.error("backend unreachable", e);
+		return Response.json({ error: "The LINE server at home is unreachable (is the server online?)." }, { status: 502 });
+	}
+	return new Response(upstream.body, {
+		status: upstream.status,
+		headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+	});
+}
 
 async function passphraseMatches(given: string, env: Env): Promise<boolean> {
 	const digest = new Uint8Array(

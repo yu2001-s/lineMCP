@@ -24,9 +24,17 @@ struct ChatListView: View {
 		.searchFocused($searchFocused)
 		.onChange(of: app.searchRequests) { searchFocused = true }
 		.task(id: query) { await search() }
-		.safeAreaInset(edge: .top, spacing: 0) { StatusStrip() }
+		.safeAreaInset(edge: .top, spacing: 0) {
+			VStack(spacing: 0) {
+				StatusStrip()
+				if !isSearching { TagFilterStrip() }
+			}
+		}
 		.overlay { placeholder }
 		.toolbar {
+			ToolbarItem {
+				tagFilterMenu
+			}
 			ToolbarItem {
 				Button {
 					app.showingNewChat = true
@@ -42,8 +50,9 @@ struct ChatListView: View {
 
 	@ViewBuilder
 	private var sections: some View {
-		let hasGroups = !app.organizer.groups.isEmpty
-		ForEach(app.sidebarSections) { section in
+		let sections = app.sidebarSections
+		let hasGroups = sections.contains { $0.group != nil }
+		ForEach(sections) { section in
 			if let group = section.group {
 				Section(isExpanded: expanded(group)) {
 					if section.chats.isEmpty, section.archived.isEmpty {
@@ -71,7 +80,7 @@ struct ChatListView: View {
 	@ViewBuilder
 	private func rows(_ section: SidebarSection) -> some View {
 		ForEach(section.chats) { chat in
-			ChatRow(chat: chat)
+			ChatRow(chat: chat, tags: app.organizer.tags(of: chat.chatId))
 				.tag(chat.chatId)
 				.contextMenu { chatMenu(chat.chatId, unread: chat.unread) }
 		}
@@ -90,6 +99,30 @@ struct ChatListView: View {
 	}
 
 	// MARK: Menus
+
+	private var tagFilterMenu: some View {
+		@Bindable var app = app
+		let filtering = !app.activeTagFilter.isEmpty
+		return Menu {
+			if app.organizer.allTags.isEmpty {
+				Text("還沒有標籤。在聊天室上按右鍵，選「標籤」。")
+			}
+			ForEach(app.organizer.allTags, id: \.self) { tag in
+				Toggle(tag, isOn: Binding(get: { app.tagFilter.contains(tag) }, set: { _ in app.toggleTagFilter(tag) }))
+			}
+			Divider()
+			Picker("顯示", selection: $app.tagFilterMatchAll) {
+				Text("有任一個選取標籤的聊天室").tag(false)
+				Text("有所有選取標籤的聊天室").tag(true)
+			}
+			.pickerStyle(.inline)
+			Button("顯示所有聊天室") { app.tagFilter = [] }
+				.disabled(!filtering)
+		} label: {
+			Label("依標籤篩選", systemImage: filtering ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+		}
+		.help("依標籤篩選聊天室")
+	}
 
 	private func chatMenu(_ chatId: String, unread: Int) -> some View {
 		ChatActions(chatId: chatId, unread: unread)
@@ -110,7 +143,8 @@ struct ChatListView: View {
 
 	@ViewBuilder
 	private var searchResults: some View {
-		let all = app.sidebarSections.flatMap { $0.chats } + app.archiveOnlyChats.compactMap { app.chat($0.chatId) }
+		// Search looks through every chat, whatever the tag filter.
+		let all = app.chats.filter { !app.organizer.isHidden($0.chatId) } + app.archiveOnlyChats.compactMap { app.chat($0.chatId) }
 		let chats = all.filter { TextFold.matches($0.name, query: query) }
 		let shown = Set(all.map(\.chatId))
 		let people = app.contacts.filter {
@@ -123,7 +157,7 @@ struct ChatListView: View {
 				Text("沒有符合的聊天").foregroundStyle(.secondary)
 			}
 			ForEach(chats) { chat in
-				ChatRow(chat: chat).tag(chat.chatId)
+				ChatRow(chat: chat, tags: app.organizer.tags(of: chat.chatId)).tag(chat.chatId)
 			}
 		}
 		if !people.isEmpty {
@@ -182,6 +216,8 @@ struct ChatListView: View {
 			}
 		} else if app.chats.isEmpty, !isSearching {
 			Text("最近 14 天沒有聊天").foregroundStyle(.secondary)
+		} else if !isSearching, !app.activeTagFilter.isEmpty, app.sidebarSections.allSatisfy({ $0.chats.isEmpty && $0.archived.isEmpty }) {
+			Text("沒有符合標籤的聊天室").foregroundStyle(.secondary)
 		}
 	}
 }
@@ -206,6 +242,7 @@ private struct GroupHeader: View {
 
 struct ChatRow: View {
 	let chat: Chat
+	var tags: [String] = []
 
 	var body: some View {
 		HStack(spacing: 10) {
@@ -236,11 +273,14 @@ struct ChatRow: View {
 					Text(preview)
 						.font(.subheadline)
 						.foregroundStyle(.secondary)
-						.lineLimit(2)
+						.lineLimit(tags.isEmpty ? 2 : 1)
 					Spacer(minLength: 4)
 					if chat.unread > 0 {
 						UnreadBadge(count: chat.unread, muted: chat.isMuted)
 					}
+				}
+				if !tags.isEmpty {
+					TagChips(tags: tags)
 				}
 			}
 		}
@@ -293,6 +333,10 @@ private struct ArchivedChatRow: View {
 					.font(.subheadline)
 					.foregroundStyle(.secondary)
 					.labelStyle(.titleAndIcon)
+				let tags = app.organizer.tags(of: chat.chatId)
+				if !tags.isEmpty {
+					TagChips(tags: tags)
+				}
 			}
 		}
 		.padding(.vertical, 4)
@@ -333,6 +377,50 @@ private struct SearchHitRow: View {
 		}
 		.padding(.vertical, 3)
 		.contentShape(Rectangle())
+	}
+}
+
+/// The tags the list is limited to, above it; clicking one drops it.
+private struct TagFilterStrip: View {
+	@Environment(AppModel.self) private var app
+
+	var body: some View {
+		let tags = app.activeTagFilter.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+		if !tags.isEmpty {
+			HStack(spacing: 6) {
+				Image(systemName: "tag")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+				ScrollView(.horizontal, showsIndicators: false) {
+					HStack(spacing: 4) {
+						ForEach(tags, id: \.self) { tag in
+							Button {
+								app.toggleTagFilter(tag)
+							} label: {
+								TagChip(name: tag)
+							}
+							.buttonStyle(.plain)
+							.help("不再依「\(tag)」篩選")
+						}
+						if tags.count > 1 {
+							Text(app.tagFilterMatchAll ? "（全部符合）" : "（任一符合）")
+								.font(.caption2)
+								.foregroundStyle(.secondary)
+						}
+					}
+				}
+				Button {
+					app.tagFilter = []
+				} label: {
+					Image(systemName: "xmark.circle.fill")
+				}
+				.buttonStyle(.plain)
+				.foregroundStyle(.secondary)
+				.help("顯示所有聊天室")
+			}
+			.padding(.horizontal, 12)
+			.padding(.bottom, 6)
+		}
 	}
 }
 

@@ -49,6 +49,11 @@ test("search matches CJK substrings and treats wildcards literally", () => {
 	assert.equal(a.search("_", { limit: 10 }).length, 1);
 	assert.equal(a.search("SURE", { limit: 10 }).length, 1);
 	assert.equal(a.search("開會", { chatId: "c" + "9".repeat(32), limit: 10 }).length, 0);
+	assert.equal(a.search("開會", { limit: 10, exclude: [chat] }).length, 0);
+	assert.equal(a.search("開會", { limit: 10, exclude: ["c" + "9".repeat(32)] }).length, 1);
+	assert.equal(a.search("開會", { limit: 10, only: [chat] }).length, 1);
+	assert.equal(a.search("開會", { limit: 10, only: ["c" + "9".repeat(32)] }).length, 0);
+	assert.equal(a.search("開會", { limit: 10, only: [] }).length, 0);
 });
 
 test("search matches Simplified and Traditional Chinese both ways", () => {

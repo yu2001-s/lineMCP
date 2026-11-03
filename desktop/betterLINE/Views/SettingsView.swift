@@ -66,7 +66,7 @@ private struct GeneralSettings: View {
 	}
 }
 
-/// Chat groups (sidebar sections) and hidden chats, both kept on this Mac.
+/// Chat groups (sidebar sections), tags and hidden chats.
 private struct ChatsSettings: View {
 	@Environment(AppModel.self) private var app
 
@@ -99,6 +99,31 @@ private struct ChatsSettings: View {
 				Text("群組會在側邊欄顯示成可收合的區塊，可以拖移調整順序。")
 			}
 			Section {
+				if app.organizer.allTags.isEmpty {
+					Text("還沒有標籤。在側邊欄的聊天室上按右鍵，選「標籤」→「新增標籤…」。")
+						.foregroundStyle(.secondary)
+				}
+				let counts = app.organizer.tagCounts
+				ForEach(app.organizer.allTags, id: \.self) { tag in
+					HStack {
+						TagChip(name: tag)
+						Spacer()
+						Text("\(counts[tag] ?? 0) 個聊天室").foregroundStyle(.secondary)
+						Button("重新命名…") { app.promptRenameTag(tag) }
+						Button(role: .destructive) {
+							app.organizer.deleteTag(tag)
+						} label: {
+							Image(systemName: "trash")
+						}
+						.help("從所有聊天室移除這個標籤")
+					}
+				}
+			} header: {
+				Text("標籤")
+			} footer: {
+				Text("一個聊天室可以有多個標籤，例如所屬的公司。在側邊欄上方可以依標籤篩選。標籤存在伺服器上，Claude 也能讀取和修改。")
+			}
+			Section {
 				if app.organizer.hidden.isEmpty {
 					Text("沒有隱藏的聊天室。").foregroundStyle(.secondary)
 				}
@@ -120,6 +145,7 @@ private struct ChatsSettings: View {
 		.formStyle(.grouped)
 		.frame(minHeight: 460)
 		.groupPrompt(app)
+		.tagPrompt(app)
 	}
 
 	private func memberCount(_ group: Organizer.Group) -> Int {

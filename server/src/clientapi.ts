@@ -4,6 +4,7 @@ import { mkdirSync } from "node:fs";
 import type { Archive, ArchiveSync } from "./archive.ts";
 import { config } from "./config.ts";
 import { readCache, writeCache } from "./mediacache.ts";
+import { type Organizer, OrganizerInputError } from "./organizer.ts";
 import {
 	errorMessage,
 	type LineEvent,
@@ -30,7 +31,7 @@ class HttpError extends Error {
  * API for the betterLINE desktop app. Reachable only on the Tailscale address,
  * and every request must carry the client key.
  */
-export function startClientApi(line: LineService, archive: Archive, sync: ArchiveSync) {
+export function startClientApi(line: LineService, archive: Archive, sync: ArchiveSync, organizer: Organizer) {
 	const expectedKey = Buffer.from(config.clientKey);
 	const cacheDir = config.mediaCacheDir;
 	mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
@@ -92,6 +93,9 @@ export function startClientApi(line: LineService, archive: Archive, sync: Archiv
 				durationMs: Number.isFinite(duration) && duration > 0 ? duration : undefined,
 			});
 		}],
+		["GET", /^\/api\/chats\/([ucr][0-9a-f]{32})\/reads$/, async (_req, _url, m) => ({
+			readers: await line.readMarkers(m[1]),
+		})],
 		["POST", /^\/api\/chats\/([ucr][0-9a-f]{32})\/read$/, async (req, _url, m) => {
 			const body = await readJson(req) as { message_id?: string };
 			if (!body.message_id) throw new HttpError(400, "message_id is required");
@@ -139,6 +143,16 @@ export function startClientApi(line: LineService, archive: Archive, sync: Archiv
 		}],
 		["GET", /^\/api\/archive$/, async () => ({ rules: archive.policy(), chats: archive.chats() })],
 		["POST", /^\/api\/archive\/sync$/, async () => ({ results: await sync.syncAll() })],
+		["GET", /^\/api\/organizer$/, async () => organizer.state()],
+		["PUT", /^\/api\/organizer$/, async (req) => {
+			const body = await readJson(req) as { base_rev?: unknown };
+			const baseRev = typeof body.base_rev === "number" ? body.base_rev : undefined;
+			return organizerInput(() => organizer.replace(body, baseRev));
+		}],
+		["POST", /^\/api\/organizer\/tags$/, async (req) => {
+			const body = await readJson(req) as { ops?: unknown };
+			return organizerInput(() => organizer.changeTags(body.ops));
+		}],
 	];
 
 	const server = createServer(async (req, res) => {
@@ -177,6 +191,15 @@ export function startClientApi(line: LineService, archive: Archive, sync: Archiv
 }
 
 const RESPONDED = Symbol("responded");
+
+function organizerInput<T>(change: () => T): T {
+	try {
+		return change();
+	} catch (e) {
+		if (e instanceof OrganizerInputError) throw new HttpError(400, e.message);
+		throw e;
+	}
+}
 
 function streamEvents(line: LineService, req: IncomingMessage, res: ServerResponse) {
 	res.writeHead(200, {

@@ -5,8 +5,11 @@ import { config } from "./config.ts";
 import { errorMessage, LineService } from "./line.ts";
 import { Archive, ArchiveSync } from "./archive.ts";
 import { startClientApi } from "./clientapi.ts";
+import { Listeners } from "./listeners.ts";
 import { buildMcpServer } from "./mcp.ts";
+import { Organizer } from "./organizer.ts";
 import { acquireSessionLock, AtomicFileStorage } from "./storage.ts";
+import { UploadError, Uploads } from "./uploads.ts";
 
 process.umask(0o077);
 
@@ -23,8 +26,14 @@ console.log(`[line] session ${line.status}${line.lastError ? `: ${line.lastError
 const archive = new Archive(config.archivePath);
 const archiveSync = new ArchiveSync(line, archive);
 archiveSync.start();
+const organizer = new Organizer(config.organizerPath);
+// Every Mac running betterLINE picks up changes, including tags an agent set.
+organizer.onChange = () => line.events.emit("event", { type: "organizer" });
+const listeners = new Listeners(config.listenersPath);
+listeners.watch(line.events);
+const uploads = new Uploads(config.uploadsDir);
 if (config.clientHost && config.clientKey.length >= 32) {
-	startClientApi(line, archive, archiveSync);
+	startClientApi(line, archive, archiveSync, organizer);
 } else {
 	console.log("[client-api] disabled (set LINE_CLIENT_HOST and a 32+ character LINE_CLIENT_KEY)");
 }
@@ -38,6 +47,16 @@ const server = createServer(async (req, res) => {
 			return json(res, 200, { ok: line.status === "ready", status: line.status });
 		}
 		if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
+		// A file an agent PUT to its line_create_upload URL, forwarded by the Worker.
+		const upload = /^\/upload\/([A-Za-z0-9_-]{32})$/.exec(path);
+		if (upload) {
+			if (req.method !== "PUT") {
+				res.setHeader("Allow", "PUT");
+				return json(res, 405, { error: "method not allowed" });
+			}
+			const saved = await uploads.receive(upload[1], req);
+			return json(res, 200, { ...saved, upload_id: upload[1], next: "Pass upload_id to line_send_file." });
+		}
 		if (path !== "/mcp") return json(res, 404, { error: "not found" });
 		if (req.method !== "POST") {
 			res.setHeader("Allow", "POST");
@@ -47,7 +66,7 @@ const server = createServer(async (req, res) => {
 		const body = await readJson(req);
 		// Stateless: a fresh server/transport per request, JSON responses only,
 		// so the Worker in front can proxy plain request/response pairs.
-		const mcp = buildMcpServer(line, archive, archiveSync);
+		const mcp = buildMcpServer(line, archive, archiveSync, organizer, listeners, uploads);
 		const transport = new StreamableHTTPServerTransport({
 			sessionIdGenerator: undefined,
 			enableJsonResponse: true,
@@ -59,6 +78,7 @@ const server = createServer(async (req, res) => {
 		await mcp.connect(transport);
 		await transport.handleRequest(req, res, body);
 	} catch (e) {
+		if (e instanceof UploadError) return json(res, e.status, { error: e.message });
 		console.error("[http]", e);
 		if (!res.headersSent) json(res, 400, { error: errorMessage(e) });
 	}

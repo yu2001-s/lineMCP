@@ -130,13 +130,25 @@ final class FramePlayer {
 					stop.pointee = true
 					return
 				}
-				self.frame = image
+				// ImageIO recycles the frame it hands over: kept as is, it turns
+				// blank once playback ends, so keep a copy instead.
+				self.frame = Self.copy(image) ?? image
 			}
 		}
 	}
 
 	func halt() {
 		generation += 1
+	}
+
+	private static func copy(_ image: CGImage) -> CGImage? {
+		let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
+		guard let context = CGContext(
+			data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+			space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue,
+		) else { return nil }
+		context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+		return context.makeImage()
 	}
 }
 

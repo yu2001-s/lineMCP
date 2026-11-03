@@ -44,9 +44,23 @@ final class AppModel {
 	/// The name prompt for creating or renaming a chat group.
 	var groupPrompt: GroupPrompt?
 	var groupNameDraft = ""
+	/// The name prompt for adding a tag to a chat or renaming one.
+	var tagPrompt: TagPrompt?
+	var tagNameDraft = ""
+	/// Tags the chat list is limited to; empty shows every chat.
+	var tagFilter: Set<String> = []
+	/// With `tagFilter`, show only chats that have every one of its tags.
+	var tagFilterMatchAll = false
 	/// Whether the main window is frontmost and visible.
 	var windowActive = false {
-		didSet { if windowActive { markSelectedReadIfVisible() } }
+		didSet {
+			guard windowActive, !oldValue else { return }
+			markSelectedReadIfVisible()
+			// Reads may have happened while the app was in the background or asleep.
+			if let chatId = selectedChatId, let conversation = conversations[chatId] {
+				Task { await conversation.refreshReads() }
+			}
+		}
 	}
 
 	var selectedChatId: String? {
@@ -60,6 +74,8 @@ final class AppModel {
 	@ObservationIgnored private var conversations: [String: Conversation] = [:]
 	@ObservationIgnored private var streamTask: Task<Void, Never>?
 	@ObservationIgnored private var chatRefreshTask: Task<Void, Never>?
+	@ObservationIgnored private var organizerPush: Task<Void, Never>?
+	@ObservationIgnored private var tagPush: Task<Void, Never>?
 	@ObservationIgnored private var lastMarked: [String: String] = [:]
 	@ObservationIgnored private var everConnected = false
 	@ObservationIgnored private var started = false
@@ -69,6 +85,8 @@ final class AppModel {
 		notifier.onOpen = { [weak self] chatId in self?.open(chatId: chatId) }
 		notifier.onReply = { [weak self] chatId, text in self?.replyFromNotification(chatId: chatId, text: text) }
 		notifier.onMarkRead = { [weak self] chatId in self?.markRead(chatId, force: true) }
+		organizer.onChange = { [weak self] in self?.scheduleOrganizerPush() }
+		organizer.onTagChange = { [weak self] in self?.scheduleTagPush() }
 	}
 
 	func start() {
@@ -212,6 +230,7 @@ final class AppModel {
 			banner = error.userMessage
 		}
 		await refreshArchive()
+		await syncOrganizer()
 	}
 
 	func refreshChats() async {
@@ -238,6 +257,80 @@ final class AppModel {
 		let results = try await api.syncArchive()
 		await refreshArchive()
 		return results
+	}
+
+	/// Groups, hidden chats and tags live on the server too, so the MCP tools
+	/// and other Macs see them. A server without `/api/organizer` is left
+	/// alone. After an organizer event, groups are left alone while this Mac
+	/// has its own changes to send: our own saves echo back too.
+	func syncOrganizer(event: Bool = false) async {
+		guard let api, let server = try? await api.organizer() else { return }
+		organizer.receiveTags(server)
+		if !organizer.pendingTagOps.isEmpty { scheduleTagPush() }
+		if event, organizer.dirty { return }
+		let hiddenBefore = organizer.hidden
+		if let state = organizer.reconcile(with: server) {
+			await pushOrganizer(state)
+		}
+		if organizer.hidden != hiddenBefore { hiddenChanged() }
+	}
+
+	private func scheduleOrganizerPush() {
+		organizerPush?.cancel()
+		organizerPush = Task {
+			try? await Task.sleep(for: .milliseconds(300))
+			guard !Task.isCancelled else { return }
+			await pushOrganizer(organizer.shared)
+		}
+	}
+
+	/// A failed push leaves the organizer dirty; the next connect sends it.
+	private func pushOrganizer(_ state: OrganizerState) async {
+		guard let api, let saved = try? await api.saveOrganizer(state, baseRev: organizer.foldersRev) else { return }
+		let hiddenBefore = organizer.hidden
+		organizer.markSaved(state, server: saved)
+		organizer.receiveTags(saved)
+		if organizer.hidden != hiddenBefore { hiddenChanged() }
+	}
+
+	/// Tag changes go out one batch at a time, so a batch never overtakes an earlier one.
+	private func scheduleTagPush() {
+		let previous = tagPush
+		tagPush = Task {
+			await previous?.value
+			try? await Task.sleep(for: .milliseconds(300))
+			await pushTags()
+		}
+	}
+
+	/// Changes the server has not confirmed stay queued (offline, or a server
+	/// older than tags) and go out on the next connect.
+	private func pushTags() async {
+		let ops = organizer.pendingTagOps
+		guard let api, !ops.isEmpty else { return }
+		do {
+			organizer.tagOpsSaved(Set(ops.map(\.id)), state: try await api.changeTags(ops))
+		} catch let APIError.server(status, _) where status == 400 {
+			// One bad change (a chat with too many tags) refuses the whole batch:
+			// send them one at a time and drop only the refused ones.
+			for op in ops {
+				do {
+					organizer.tagOpsSaved([op.id], state: try await api.changeTags([op]))
+				} catch let APIError.server(status, message) where status == 400 {
+					organizer.dropTagOps([op.id])
+					banner = "無法更新標籤：\(message)"
+				} catch {
+					return
+				}
+			}
+		} catch {}
+	}
+
+	/// Another Mac hid or unhid chats.
+	private func hiddenChanged() {
+		if let chatId = selectedChatId, organizer.isHidden(chatId) { selectedChatId = nil }
+		for chatId in organizer.hidden.keys { notifier.clear(chatId: chatId) }
+		updateBadge()
 	}
 
 	private func scheduleChatRefresh() {
@@ -275,7 +368,10 @@ final class AppModel {
 			noteRemoved(chatId: chatId, messageId: messageId)
 			notifier.remove(messageId: messageId)
 		case let .read(chatId, readerId, messageId):
-			conversations[chatId]?.noteRead(readerId: readerId, messageId: messageId)
+			// Kept even for a chat not opened yet. A 1:1 chat may be named by the
+			// owner's own mid; the chat is then the reader.
+			let chat = chatId == me?.id ? readerId : chatId
+			conversation(chat).noteRead(readerId: readerId, messageId: messageId)
 		case let .chatRead(chatId, _):
 			// Read on another device.
 			setUnread(chatId, 0)
@@ -284,6 +380,8 @@ final class AppModel {
 			conversations[chatId]?.scheduleRefresh()
 		case .chatUpdate:
 			scheduleChatRefresh()
+		case .organizer:
+			Task { await syncOrganizer(event: true) }
 		case let .status(status):
 			let previous = sessionStatus
 			sessionStatus = status
@@ -387,11 +485,21 @@ final class AppModel {
 			.sorted { ($0.newest ?? 0) > ($1.newest ?? 0) }
 	}
 
+	/// The tag filter, without tags no chat has any more.
+	var activeTagFilter: Set<String> {
+		tagFilter.intersection(organizer.allTags)
+	}
+
 	/// The sidebar: one section per group in the owner's order, then ungrouped
-	/// chats, then archive-only ones. Hidden chats appear nowhere.
+	/// chats, then archive-only ones, all limited to the tag filter. Hidden
+	/// chats appear nowhere.
 	var sidebarSections: [SidebarSection] {
-		let visible = chats.filter { !organizer.isHidden($0.chatId) }
-		let older = archiveOnlyChats
+		let filter = activeTagFilter
+		let shown = { [organizer, tagFilterMatchAll] (chatId: String) in
+			filter.isEmpty || organizer.matches(chatId, tags: filter, all: tagFilterMatchAll)
+		}
+		let visible = chats.filter { !organizer.isHidden($0.chatId) && shown($0.chatId) }
+		let older = archiveOnlyChats.filter { shown($0.chatId) }
 		var sections = organizer.groups.map { group in
 			SidebarSection(
 				id: group.id.uuidString,
@@ -399,6 +507,9 @@ final class AppModel {
 				chats: visible.filter { organizer.membership[$0.chatId] == group.id },
 				archived: older.filter { organizer.membership[$0.chatId] == group.id },
 			)
+		}
+		if !filter.isEmpty {
+			sections.removeAll { $0.chats.isEmpty && $0.archived.isEmpty }
 		}
 		sections.append(SidebarSection(id: "ungrouped", group: nil, chats: visible.filter { organizer.group(of: $0.chatId) == nil }, archived: []))
 		let olderUngrouped = older.filter { organizer.group(of: $0.chatId) == nil }
@@ -449,6 +560,40 @@ final class AppModel {
 			break
 		}
 		groupPrompt = nil
+	}
+
+	func promptNewTag(for chatId: String) {
+		tagNameDraft = ""
+		tagPrompt = .add(chatId: chatId)
+	}
+
+	func promptRenameTag(_ name: String) {
+		tagNameDraft = name
+		tagPrompt = .rename(name)
+	}
+
+	func commitTagPrompt() {
+		switch tagPrompt {
+		case let .add(chatId):
+			organizer.addTags([tagNameDraft], to: [chatId])
+		case let .rename(name):
+			renameTag(name, to: tagNameDraft)
+		case nil:
+			break
+		}
+		tagPrompt = nil
+	}
+
+	/// Renames a tag everywhere; the filter follows it.
+	func renameTag(_ name: String, to newName: String) {
+		organizer.renameTag(name, to: newName)
+		guard tagFilter.remove(name) != nil else { return }
+		let fold = TextFold.fold(Organizer.tagName(newName))
+		if let renamed = organizer.allTags.first(where: { TextFold.fold($0) == fold }) { tagFilter.insert(renamed) }
+	}
+
+	func toggleTagFilter(_ tag: String) {
+		if tagFilter.remove(tag) == nil { tagFilter.insert(tag) }
 	}
 
 	func isArchived(_ chatId: String) -> Bool {
@@ -558,4 +703,9 @@ struct SidebarSection: Identifiable {
 enum GroupPrompt {
 	case new(assigning: String?)
 	case rename(Organizer.Group)
+}
+
+enum TagPrompt {
+	case add(chatId: String)
+	case rename(String)
 }

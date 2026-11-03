@@ -11,6 +11,14 @@ export const config = {
 	sendLogPath: join(stateDir, "sent.log"),
 	archivePath: join(stateDir, "archive.db"),
 	mediaCacheDir: join(stateDir, "media-cache"),
+	/** Folders and hidden chats from the desktop app. */
+	organizerPath: join(stateDir, "organizer.json"),
+	/** Listeners the agents set up through the tools. */
+	listenersPath: join(stateDir, "listeners.json"),
+	/** Files agents uploaded to send, kept for an hour. */
+	uploadsDir: join(stateDir, "uploads"),
+	/** The Worker's address, where agents upload files (`/upload/<id>`). */
+	publicUrl: process.env.LINE_MCP_PUBLIC_URL ?? "https://line-mcp.your-subdomain.workers.dev",
 	/** Desktop client API: bound to the Tailscale address only. */
 	clientHost: process.env.LINE_CLIENT_HOST ?? "",
 	clientPort: Number(process.env.LINE_CLIENT_PORT ?? 8791),

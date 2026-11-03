@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
+import SwiftUI
 import Testing
+import UniformTypeIdentifiers
 @testable import betterLINE
 
 struct DecodingTests {
@@ -210,6 +212,215 @@ struct OrganizerTests {
 		reloaded.unhide("u7")
 		#expect(!Organizer(defaults: defaults).isHidden("u7"))
 	}
+
+	@Test func firstSyncKeepsBothSides() throws {
+		let organizer = fresh()
+		let work = try #require(organizer.addGroup(named: "work"))
+		let gym = try #require(organizer.addGroup(named: "健身"))
+		organizer.assign("u1", to: work.id)
+		organizer.assign("u2", to: work.id)
+		organizer.assign("u3", to: gym.id)
+		organizer.hide("u9", name: "某人")
+		let serverWork = UUID()
+		let server = OrganizerState(
+			folders: [.init(id: serverWork, name: "Work", chatIds: ["u2", "u4"])],
+			hidden: [.init(chatId: "u8", name: "別人")],
+			updatedMs: 1,
+		)
+
+		let push = try #require(organizer.reconcile(with: server))
+		#expect(organizer.synced)
+		#expect(organizer.groups.map(\.name) == ["Work", "健身"], "same-named groups merge into the server's")
+		#expect(organizer.group(of: "u1")?.id == serverWork)
+		#expect(organizer.group(of: "u4")?.id == serverWork)
+		#expect(organizer.group(of: "u3")?.name == "健身")
+		#expect(organizer.isHidden("u8") && organizer.isHidden("u9"))
+		#expect(push.folders.map(\.chatIds) == [["u1", "u2", "u4"], ["u3"]])
+
+		organizer.markSaved(push, server: push)
+		#expect(!organizer.dirty)
+	}
+
+	@Test func laterSyncsFollowTheServerUnlessChangedHere() throws {
+		let organizer = fresh()
+		let empty = OrganizerState(folders: [], hidden: [], updatedMs: 0)
+		#expect(organizer.reconcile(with: empty) == nil, "nothing to send when both sides are empty")
+		var pushes = 0
+		organizer.onChange = { pushes += 1 }
+
+		let fromOtherMac = OrganizerState(folders: [.init(id: UUID(), name: "家人", chatIds: ["c1"])], hidden: [.init(chatId: "u5", name: "x")])
+		#expect(organizer.reconcile(with: fromOtherMac) == nil)
+		#expect(organizer.group(of: "c1")?.name == "家人")
+		#expect(organizer.isHidden("u5"))
+		#expect(pushes == 0, "applying the server's copy is not a local change")
+
+		organizer.unhide("u5")
+		#expect(pushes == 1 && organizer.dirty)
+		let push = try #require(organizer.reconcile(with: fromOtherMac), "a change made offline wins")
+		#expect(push.hidden.isEmpty)
+		#expect(organizer.isHidden("u5") == false)
+
+		organizer.markSaved(fromOtherMac, server: fromOtherMac)
+		#expect(organizer.dirty, "only the state this Mac has now clears it")
+		organizer.markSaved(push, server: push)
+		#expect(!organizer.dirty)
+	}
+
+	@Test func savesCarryTheRevisionAndTakeBackAgentChanges() throws {
+		let defaults = MemoryDefaults()
+		let organizer = Organizer(defaults: defaults)
+		let work = UUID()
+		let server = OrganizerState(folders: [.init(id: work, name: "Work", chatIds: ["u1"])], hidden: [], rev: 5)
+		#expect(organizer.reconcile(with: server) == nil)
+		#expect(organizer.foldersRev == 5)
+
+		// Offline: the owner files u2 while an agent files u3 and hides u4 on the server.
+		organizer.assign("u2", to: work)
+		let push = try #require(organizer.reconcile(with: OrganizerState(folders: [.init(id: work, name: "Work", chatIds: ["u1", "u3"])], hidden: [], rev: 6)))
+		#expect(organizer.foldersRev == 5, "a save from here is based on what this Mac last took from the server")
+		#expect(push.folders[0].chatIds == ["u1", "u2"])
+
+		// The server replays the agent's changes on top of the save.
+		let saved = OrganizerState(
+			folders: [.init(id: work, name: "Work", chatIds: ["u1", "u2", "u3"])],
+			hidden: [.init(chatId: "u4", name: "某人")],
+			rev: 7,
+		)
+		organizer.markSaved(push, server: saved)
+		#expect(!organizer.dirty)
+		#expect(organizer.group(of: "u3")?.id == work)
+		#expect(organizer.isHidden("u4"))
+		#expect(organizer.foldersRev == 7)
+		#expect(Organizer(defaults: defaults).foldersRev == 7)
+	}
+
+	@Test func saveBodyNamesTheBaseRevision() throws {
+		let save = OrganizerSave(folders: [], hidden: [], baseRev: 12)
+		let body = try #require(String(data: JSONEncoder.api.encode(save), encoding: .utf8))
+		#expect(body.contains(#""base_rev":12"#))
+		#expect(!body.contains("tags"))
+	}
+
+	@Test func organizerWireFormat() throws {
+		let id = UUID()
+		let state = OrganizerState(folders: [.init(id: id, name: "Work", chatIds: ["u1"])], hidden: [.init(chatId: "u2", name: "某人")])
+		let body = try #require(String(data: JSONEncoder.api.encode(state), encoding: .utf8))
+		#expect(body.contains(#""chat_ids":["u1"]"#))
+		#expect(body.contains(#""chat_id":"u2""#))
+		let served = try JSONDecoder.api.decode(OrganizerState.self, from: Data(#"{"folders":[{"id":"\#(id.uuidString.lowercased())","name":"Work","chat_ids":["u1"]}],"hidden":[{"chat_id":"u2","name":"某人"}],"updated_ms":5}"#.utf8))
+		#expect(served.sameContent(as: state))
+		#expect(served.updatedMs == 5)
+		let event = try JSONDecoder.api.decode(LineEvent.self, from: Data(#"{"type":"organizer"}"#.utf8))
+		guard case .organizer = event else { Issue.record("expected .organizer"); return }
+	}
+}
+
+@MainActor
+struct TagTests {
+	private func fresh(_ defaults: UserDefaults = MemoryDefaults()) -> Organizer {
+		Organizer(defaults: defaults)
+	}
+
+	private func state(rev: Int, _ tags: [String: [String]]) -> OrganizerState {
+		OrganizerState(folders: [], hidden: [], tags: tags.map { .init(chatId: $0.key, tags: $0.value) }, rev: rev)
+	}
+
+	@Test func severalTagsPerChatAndOneTagPerSpelling() {
+		let organizer = fresh()
+		var pushes = 0
+		organizer.onTagChange = { pushes += 1 }
+		organizer.addTags(["讀書會", " 羽球 ", "  "], to: ["u1", "u2"])
+		organizer.addTags(["读书会", "Book  Club"], to: ["u3"])
+		organizer.addTags(["book club"], to: ["u1"])
+		#expect(organizer.tags(of: "u1") == ["Book Club", "羽球", "讀書會"].sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+		#expect(organizer.tags(of: "u3").contains("讀書會"), "Simplified and Traditional spellings are one tag")
+		#expect(organizer.allTags.count == 3)
+		#expect(organizer.tagCounts["讀書會"] == 3)
+		#expect(pushes == 3)
+
+		organizer.removeTags(["讀書會", "羽球"], from: ["u2"])
+		#expect(organizer.tags(of: "u2").isEmpty)
+		#expect(organizer.tags["u2"] == nil, "a chat without tags is not kept")
+		organizer.renameTag("羽球", to: "讀書會")
+		#expect(organizer.tags(of: "u1") == ["Book Club", "讀書會"], "renaming to an existing tag merges them")
+		organizer.renameTag("book club", to: "BOOK CLUB")
+		#expect(organizer.tags(of: "u3").contains("BOOK CLUB"))
+		organizer.deleteTag("读书会")
+		#expect(organizer.allTags == ["BOOK CLUB"])
+	}
+
+	@Test func filterMatchesAnyOrAllTags() {
+		let organizer = fresh()
+		organizer.addTags(["讀書會", "羽球"], to: ["u1"])
+		organizer.addTags(["讀書會"], to: ["u2"])
+		organizer.addTags(["同事"], to: ["u3"])
+		let both: Set = ["讀書會", "同事"]
+		#expect(organizer.matches("u1", tags: both, all: false))
+		#expect(organizer.matches("u3", tags: both, all: false))
+		#expect(!organizer.matches("u1", tags: both, all: true))
+		#expect(organizer.matches("u1", tags: ["讀書會", "羽球"], all: true))
+		#expect(!organizer.matches("u4", tags: ["讀書會"], all: false))
+	}
+
+	@Test func changesMadeOfflineStayOnTopOfTheServersCopyUntilConfirmed() throws {
+		let defaults = MemoryDefaults()
+		let organizer = fresh(defaults)
+		organizer.receiveTags(state(rev: 3, ["u1": ["同事"], "u2": ["讀書會"]]))
+		organizer.addTags(["讀書會"], to: ["u1"])
+		organizer.removeTags(["讀書會"], from: ["u2"])
+		#expect(organizer.pendingTagOps.count == 2)
+
+		// Quit and relaunch while offline: both copies are kept.
+		let reloaded = fresh(defaults)
+		#expect(reloaded.pendingTagOps == organizer.pendingTagOps)
+		#expect(reloaded.tags(of: "u1") == ["讀書會", "同事"].sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+		#expect(reloaded.tags(of: "u2").isEmpty)
+
+		// Meanwhile an agent tagged u3; the server's copy shows it, ours still apply on top.
+		reloaded.receiveTags(state(rev: 4, ["u1": ["同事"], "u2": ["讀書會"], "u3": ["讀書會"]]))
+		#expect(reloaded.tags(of: "u3") == ["讀書會"])
+		#expect(reloaded.tags(of: "u2").isEmpty)
+
+		let first = try #require(reloaded.pendingTagOps.first)
+		reloaded.tagOpsSaved([first.id], state: state(rev: 5, ["u1": ["讀書會", "同事"], "u2": ["讀書會"], "u3": ["讀書會"]]))
+		#expect(reloaded.pendingTagOps.count == 1, "only what the server confirmed leaves the queue")
+		#expect(reloaded.tags(of: "u2").isEmpty)
+
+		// A copy older than one already applied (a slow response) is ignored.
+		reloaded.receiveTags(state(rev: 2, [:]))
+		#expect(reloaded.tags(of: "u3") == ["讀書會"])
+
+		reloaded.dropTagOps(Set(reloaded.pendingTagOps.map(\.id)))
+		#expect(reloaded.pendingTagOps.isEmpty)
+		#expect(reloaded.tags(of: "u2") == ["讀書會"], "a refused change is undone")
+	}
+
+	@Test func aServerOlderThanTagsKeepsChangesQueued() {
+		let organizer = fresh()
+		organizer.addTags(["讀書會"], to: ["u1"])
+		organizer.receiveTags(OrganizerState(folders: [], hidden: [], updatedMs: 1))
+		#expect(organizer.tags(of: "u1") == ["讀書會"])
+		#expect(organizer.pendingTagOps.count == 1)
+	}
+
+	@Test func tagWireFormat() throws {
+		let op = TagOp(op: .add, tags: ["讀書會"], chatIds: ["u1"])
+		let body = try #require(String(data: JSONEncoder.api.encode(op), encoding: .utf8))
+		#expect(body.contains(#""chat_ids":["u1"]"#))
+		#expect(body.contains(#""op":"add""#))
+		let rename = try #require(String(data: JSONEncoder.api.encode(TagOp(op: .rename, tags: ["a"], to: "b")), encoding: .utf8))
+		#expect(rename.contains(#""to":"b""#) && !rename.contains("chat_ids"))
+
+		let served = try JSONDecoder.api.decode(OrganizerState.self, from: Data(#"{"folders":[],"hidden":[],"tags":[{"chat_id":"u1","tags":["讀書會","a_b"]}],"rev":7,"updated_ms":5}"#.utf8))
+		#expect(served.tags == [.init(chatId: "u1", tags: ["讀書會", "a_b"])])
+		#expect(served.rev == 7)
+
+		// Saving groups never sends tags, so a save cannot overwrite them.
+		let organizer = fresh()
+		organizer.addTags(["讀書會"], to: ["u1"])
+		let saved = try #require(String(data: JSONEncoder.api.encode(organizer.shared), encoding: .utf8))
+		#expect(!saved.contains("tags") && !saved.contains("rev"))
+	}
 }
 
 struct ContactDecodingTests {
@@ -291,6 +502,69 @@ struct ClipboardTests {
 		let pasteboard = board()
 		pasteboard.writeObjects([file as NSURL])
 		#expect(Clipboard.attachments(from: pasteboard)?.map(\.lastPathComponent) == [file.lastPathComponent])
+	}
+}
+
+@MainActor
+struct ComposerTests {
+	/// A composer's text view wired to plain fields instead of SwiftUI state.
+	@MainActor
+	private final class Harness {
+		var text = ""
+		var height: CGFloat = 20
+		var composing = false
+		let input = InputTextView()
+		private var coordinator: ComposerTextView.Coordinator!
+		// Input methods edit through the window's input context, so the view needs one.
+		private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 40), styleMask: .borderless, backing: .buffered, defer: true)
+
+		init() {
+			let view = ComposerTextView(
+				text: Binding(get: { self.text }, set: { self.text = $0 }),
+				height: Binding(get: { self.height }, set: { self.height = $0 }),
+				composing: Binding(get: { self.composing }, set: { self.composing = $0 }),
+				sendOnEnter: true,
+				focusKey: "",
+				onSubmit: {},
+				onFiles: { _ in },
+				onEscape: {},
+			)
+			coordinator = view.makeCoordinator()
+			input.delegate = coordinator
+			input.coordinator = coordinator
+			window.contentView = input
+			window.makeFirstResponder(input)
+		}
+
+		func mark(_ text: String) {
+			input.setMarkedText(text, selectedRange: NSRange(location: text.utf16.count, length: 0), replacementRange: none)
+		}
+
+		func commit(_ text: String) {
+			input.insertText(text, replacementRange: none)
+		}
+
+		private var none: NSRange { NSRange(location: NSNotFound, length: 0) }
+	}
+
+	@Test func placeholderHidesWhileAnInputMethodComposes() {
+		let composer = Harness()
+		composer.mark("ㄉ")
+		#expect(composer.composing)
+		#expect(composer.text.isEmpty, "marked text isn't the draft until it's committed")
+
+		composer.commit("的")
+		#expect(!composer.composing)
+		#expect(composer.text == "的", "the candidate replaces the zhuyin")
+	}
+
+	@Test func cancellingTheInputMethodShowsThePlaceholderAgain() {
+		let composer = Harness()
+		composer.mark("ㄉ")
+		#expect(composer.composing)
+		composer.mark("")
+		#expect(!composer.composing)
+		#expect(composer.text.isEmpty)
 	}
 }
 
@@ -395,5 +669,62 @@ struct ImagePipelineTests {
 		let bubble = try #require(await pipeline.image(key: "file:\(file.path)", maxPixel: 640) { file })
 		#expect(chip.size.width == 96)
 		#expect(bubble.size.width == 640)
+	}
+}
+
+struct ReadOrderTests {
+	@Test func messageIdsOrderByValue() {
+		#expect(MessageOrder.id("634900000000000004", isAtLeast: "634900000000000003"))
+		#expect(!MessageOrder.id("634900000000000003", isAtLeast: "634900000000000004"))
+		#expect(MessageOrder.id("634900000000000004", isAtLeast: "634900000000000004"))
+		// Old short ids are older than today's long ones.
+		#expect(MessageOrder.id("634900000000000001", isAtLeast: "12100000000001"))
+		#expect(!MessageOrder.id("12100000000001", isAtLeast: "463100000000000001"))
+	}
+
+	@Test func readMarkersDecode() throws {
+		let markers = try JSONDecoder.api.decode(ReadMarkers.self, from: Data(#"{"readers":{"u1":"634900000000000003"}}"#.utf8))
+		#expect(markers.readers["u1"] == "634900000000000003")
+	}
+}
+
+@MainActor
+struct StickerAnimationTests {
+	/// A three-frame APNG of solid squares, like a short animated sticker.
+	private func apng() throws -> Data {
+		let data = NSMutableData()
+		let dest = try #require(CGImageDestinationCreateWithData(data as CFMutableData, UTType.png.identifier as CFString, 3, nil))
+		CGImageDestinationSetProperties(dest, [kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGLoopCount: 1]] as CFDictionary)
+		for color in [NSColor.systemRed, .systemGreen, .systemBlue] {
+			let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 40, bitsPerSample: 8, samplesPerPixel: 4,
+				hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+			NSGraphicsContext.saveGraphicsState()
+			NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+			color.setFill()
+			NSRect(x: 0, y: 0, width: 40, height: 40).fill()
+			NSGraphicsContext.restoreGraphicsState()
+			CGImageDestinationAddImage(dest, rep.cgImage!, [kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGDelayTime: 0.05]] as CFDictionary)
+		}
+		#expect(CGImageDestinationFinalize(dest))
+		return data as Data
+	}
+
+	private func visibleFraction(_ image: CGImage) -> Double {
+		let w = image.width, h = image.height
+		var px = [UInt8](repeating: 0, count: w * h * 4)
+		let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+			space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+		ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+		return Double(stride(from: 3, to: px.count, by: 4).filter { px[$0] > 0 }.count) / Double(w * h)
+	}
+
+	/// ImageIO recycles the frames it hands to the animation block; a frame kept
+	/// after playback ended used to come out blank, so animated stickers vanished.
+	@Test func lastFrameStaysVisibleAfterPlayback() async throws {
+		let player = FramePlayer()
+		player.play(try apng())
+		try await Task.sleep(for: .seconds(1))
+		let frame = try #require(player.frame)
+		#expect(visibleFraction(frame) > 0.9)
 	}
 }

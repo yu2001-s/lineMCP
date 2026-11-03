@@ -8,6 +8,7 @@ struct Composer: View {
 
 	@Environment(AppModel.self) private var app
 	@State private var height: CGFloat = 20
+	@State private var composing = false
 	@State private var showStickers = false
 
 	var body: some View {
@@ -45,6 +46,7 @@ struct Composer: View {
 					ComposerTextView(
 						text: $conversation.draft,
 						height: $height,
+						composing: $composing,
 						sendOnEnter: app.prefs.sendOnEnter,
 						focusKey: "\(chat.chatId)#\(conversation.composerFocusRequests)",
 						onSubmit: { conversation.sendDraft() },
@@ -53,7 +55,7 @@ struct Composer: View {
 					)
 					.frame(height: min(max(height, 20), 150))
 					.overlay(alignment: .topLeading) {
-						if conversation.draft.isEmpty {
+						if conversation.draft.isEmpty, !composing {
 							Text("訊息")
 								.foregroundStyle(.tertiary)
 								.padding(.leading, 5)
@@ -214,6 +216,7 @@ private struct StickerPicker: View {
 struct ComposerTextView: NSViewRepresentable {
 	@Binding var text: String
 	@Binding var height: CGFloat
+	@Binding var composing: Bool
 	var sendOnEnter: Bool
 	var focusKey: String
 	var onSubmit: () -> Void
@@ -276,7 +279,19 @@ struct ComposerTextView: NSViewRepresentable {
 		func textDidChange(_ notification: Notification) {
 			guard let textView = notification.object as? NSTextView else { return }
 			parent.text = textView.string
+			markedTextDidChange(textView)
 			updateHeight(textView)
+		}
+
+		/// NSTextView posts no textDidChange while an input method composes
+		/// (zhuyin, pinyin), so InputTextView reports its marked text here and
+		/// the placeholder hides under the first keystroke. It leaves layout
+		/// alone: the first touch of layoutManager moves the view off TextKit 2,
+		/// and doing that mid-composition drops the marked text, so committing
+		/// appends the candidate to the zhuyin instead of replacing it.
+		func markedTextDidChange(_ textView: NSTextView) {
+			let composing = textView.hasMarkedText()
+			if parent.composing != composing { parent.composing = composing }
 		}
 
 		func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -325,6 +340,16 @@ final class InputTextView: NSTextView {
 			return
 		}
 		super.keyDown(with: event)
+	}
+
+	override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+		super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+		coordinator?.markedTextDidChange(self)
+	}
+
+	override func unmarkText() {
+		super.unmarkText()
+		coordinator?.markedTextDidChange(self)
 	}
 
 	override func paste(_ sender: Any?) {

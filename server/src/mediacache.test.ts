@@ -32,3 +32,14 @@ test("over the limit, the oldest files go first", () => {
 	assert.ok(readCache(dir, "2"));
 	assert.ok(readCache(dir, "3"));
 });
+
+test("an entry cached without a real type is typed on the way out", () => {
+	const dir = mkdtempSync(join(tmpdir(), "media-"));
+	writeCache(dir, "637900000000000001", { data: new Uint8Array(4), type: "application/octet-stream", name: "活動預算.xlsx" });
+	assert.equal(
+		readCache(dir, "637900000000000001")?.type,
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	);
+	writeCache(dir, "1", { data: new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), type: "", name: "1" });
+	assert.equal(readCache(dir, "1")?.type, "image/jpeg");
+});
