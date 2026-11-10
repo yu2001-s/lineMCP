@@ -9,7 +9,6 @@ const amy = "u" + "a".repeat(32);
 const bob = "u" + "b".repeat(32);
 const cat = "u" + "d".repeat(32);
 const team = "c" + "c".repeat(32);
-const work = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 const path = () => join(mkdtempSync(join(tmpdir(), "line-tags-")), "organizer.json");
 
 test("a chat can have several tags, kept across restarts", () => {
@@ -65,17 +64,28 @@ test("rename respells a tag or merges it into another; delete takes it off every
 	assert.deepEqual(o.state().tags, []);
 });
 
-test("a desktop save of folders and hidden chats leaves tags an agent just added", () => {
+test("a desktop save of hidden chats leaves tags an agent just added", () => {
 	const o = new Organizer(path());
 	const events: number[] = [];
 	o.onChange = () => events.push(o.state().rev);
-	o.replace({ folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [] });
+	o.replace({ hidden: [] });
 	// An agent tags a chat; the desktop then saves its (tag-less) copy.
 	o.addTags([amy, bob], ["讀書會"]);
-	o.replace({ folders: [{ id: work, name: "Work", chat_ids: [amy, bob] }], hidden: [], tags: [] });
+	o.replace({ hidden: [{ chat_id: cat, name: "Cat" }], tags: [] });
 	assert.deepEqual(o.tagsOf(bob), ["讀書會"]);
-	assert.deepEqual(o.folderOf(bob)?.name, "Work");
+	assert.ok(o.isHidden(cat));
 	assert.deepEqual(events, [1, 2, 3], "every change, from either side, bumps rev and notifies");
+});
+
+test("renaming a tag reports its old and new spelling", () => {
+	const o = new Organizer(path());
+	const renames: string[][] = [];
+	o.onTagRename = (from, to) => renames.push([from, to]);
+	o.addTags([amy], ["Work"]);
+	o.addTags([bob], ["Office"]);
+	o.changeTags([{ op: "rename", tags: ["work"], to: "office" }, { op: "rename", tags: ["nobody"], to: "x" }]);
+	assert.deepEqual(renames, [["Work", "Office"]]);
+	assert.deepEqual(o.tagsOf(amy), ["Office"]);
 });
 
 test("ops from a desktop that was offline apply on top of what agents did meanwhile", () => {
@@ -128,7 +138,7 @@ test("bad tag changes are rejected and change nothing", () => {
 
 test("a file saved before tags existed loads with none", () => {
 	const file = path();
-	writeFileSync(file, JSON.stringify({ folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [], updated_ms: 5 }));
+	writeFileSync(file, JSON.stringify({ hidden: [], updated_ms: 5 }));
 	const o = new Organizer(file);
 	assert.deepEqual(o.state().tags, []);
 	assert.equal(o.state().rev, 0);
@@ -137,7 +147,6 @@ test("a file saved before tags existed loads with none", () => {
 	const saved = JSON.parse(readFileSync(file, "utf-8"));
 	assert.equal(saved.updated_ms, 5, "tag changes do not count as a desktop save");
 	assert.equal(saved.rev, 1);
-	assert.equal(saved.folders[0].name, "Work");
 });
 
 test("the MCP tools list, add, remove and filter by tags, and leave hidden chats alone", async () => {

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -6,9 +5,9 @@ import { type Archive, type ArchiveSync, lastSyncLabel } from "./archive.ts";
 import { config } from "./config.ts";
 import { chatType, errorMessage, formatTime, type LineService, type MediaFile, REACTIONS } from "./line.ts";
 import { readCache, writeCache } from "./mediacache.ts";
-import type { Listeners } from "./listeners.ts";
+import { type Listeners, maskHeaders } from "./listeners.ts";
 import { FILE_LIMIT, formatSize, isTextFile, previewImage, readText, sendKind, textFileType } from "./mediatools.ts";
-import type { FolderOp, Organizer } from "./organizer.ts";
+import type { Organizer } from "./organizer.ts";
 import { UPLOAD_ID_RE, type Uploads } from "./uploads.ts";
 
 // Hosts cut server instructions off at 2048 characters (mcp.test.ts checks
@@ -17,10 +16,10 @@ export const INSTRUCTIONS = `Tools for the user's personal LINE account (tool de
 
 - Chat ids: u… 1:1, c… group, r… multi-person room. line_search_contacts and line_list_chats find them.
 - line_read_messages reads the last 14 days, all LINE serves. Archived chats are also kept locally: line_read_archive reads further back and line_search_messages searches them (archived chats only). The line_archive_* tools choose which chats are archived.
-- The user sorts chats into betterLINE folders, which the app calls 群組 (the word LINE also uses for groups), and tags them, e.g. by the company a contact works at (Acme). line_list_folders and line_list_tags list them, the folder and tags filters narrow line_list_chats and line_search_messages, and line_folder_* / line_tag_* change them.
+- The user tags chats in betterLINE, e.g. Work, or the company a contact works at (Acme); a chat can have several tags, and betterLINE shows the chats by tag. line_list_tags lists them, the tags filter narrows line_list_chats and line_search_messages, and line_tag_* change them.
 - Chats the user hid in betterLINE are left out of every tool; line_hide_chats hides more.
 - line_send_message, line_send_sticker, line_send_file (text you wrote, or any file uploaded with line_create_upload) and line_forward_media send; line_react, line_unsend and line_mark_read act on messages; line_read_receipts shows who read what; line_get_media opens photos and files.
-- line_listen_set POSTs every new message in the chosen chats to a webhook.
+- line_listen_set POSTs every new message in the chosen chats or tags to a webhook.
 - Reading never marks messages read.`;
 
 const HIDDEN = "The owner hid this chat in betterLINE, so these tools leave it alone. They can unhide it in betterLINE → Settings → 聊天室.";
@@ -43,8 +42,6 @@ const messageId = z
 	.string()
 	.regex(/^\d+$/)
 	.describe("Message id from line_read_messages or line_read_archive");
-
-const folderName = z.string().trim().min(1).max(200);
 
 const fileName = z
 	.string()
@@ -94,12 +91,6 @@ export function buildMcpServer(
 		const names = await line.chatNames(unique).catch(() => new Map<string, string>());
 		return { chats: unique.map((id) => ({ chat_id: id, name: names.get(id), tags: organizer.tagsOf(id) })) };
 	};
-	const chatsWithFolders = async (ids: string[]) => {
-		const unique = [...new Set(ids)];
-		const names = await line.chatNames(unique).catch(() => new Map<string, string>());
-		return { chats: unique.map((id) => ({ chat_id: id, name: names.get(id), folder: organizer.folderOf(id)?.name ?? null })) };
-	};
-	const folderSummary = () => organizer.state().folders.map((f) => ({ name: f.name, chats: f.chat_ids.filter(visible).length }));
 	const tagSummary = () => visibleTags().map((t) => ({ name: t.name, chats: t.chat_ids.length }));
 
 	server.registerTool(
@@ -118,12 +109,11 @@ export function buildMcpServer(
 			title: "List LINE chats",
 			description:
 				"Lists recent chats (1:1, groups, rooms) with unread counts and the latest message, newest first. " +
-				"Each chat the owner filed into a betterLINE folder says which one, and each tagged chat lists its tags. " +
-				"Only chats with messages in the last 14 days; line_list_folders and line_list_tags list every chat.",
+				"Each tagged chat lists its tags. " +
+				"Only chats with messages in the last 14 days; line_list_tags lists every tagged chat.",
 			inputSchema: {
 				limit: z.number().int().min(1).max(100).default(20),
 				unread_only: z.boolean().default(false).describe("Only chats with unread messages"),
-				folder: z.string().min(1).optional().describe("Only chats in this betterLINE folder (see line_list_folders)"),
 				tags: tagFilter.optional().describe(
 					"Only chats with any of these tags (all of them with match_all_tags), see line_list_tags",
 				),
@@ -131,19 +121,17 @@ export function buildMcpServer(
 			},
 			annotations: { readOnlyHint: true, openWorldHint: true },
 		},
-		({ limit, unread_only, folder, tags, match_all_tags }) =>
+		({ limit, unread_only, tags, match_all_tags }) =>
 			run(async () => {
-				const only = folder === undefined ? undefined : folderNamed(organizer, folder);
 				const tagged = tags === undefined ? undefined : taggedWith(tagsNamed(tags), match_all_tags);
 				const chats = await line.listChats({
 					limit,
 					unreadOnly: unread_only,
-					include: (id) => visible(id) && (!only || only.chat_ids.includes(id)) && (!tagged || tagged(id)),
+					include: (id) => visible(id) && (!tagged || tagged(id)),
 				});
 				return chats.map((c) => {
-					const name = organizer.folderOf(c.chat_id)?.name;
 					const chatTags = organizer.tagsOf(c.chat_id);
-					return { ...c, ...(name ? { folder: name } : {}), ...(chatTags.length ? { tags: chatTags } : {}) };
+					return chatTags.length ? { ...c, tags: chatTags } : c;
 				});
 			}),
 	);
@@ -153,8 +141,8 @@ export function buildMcpServer(
 		{
 			title: "List betterLINE tags",
 			description:
-				"Lists the tags on the owner's chats (for example the company a contact works at) with every chat that has each, " +
-				"including chats with no messages in the last 14 days. A chat can have several tags.",
+				"Lists the tags on the owner's chats (for example Work, or the company a contact works at) with every chat that has each, " +
+				"including chats with no messages in the last 14 days. A chat can have several tags. betterLINE shows the chats by tag.",
 			annotations: { readOnlyHint: true, openWorldHint: true },
 		},
 		() =>
@@ -180,7 +168,7 @@ export function buildMcpServer(
 				"(ignoring case and Simplified/Traditional Chinese) adds that tag. Only when the owner asked for it, or as part of a task they gave you.",
 			inputSchema: {
 				chat_ids: z.array(chatId).min(1).max(100).describe("Chats to tag"),
-				tags: tagNames.describe("Tags to add, e.g. a company name such as Acme"),
+				tags: tagNames.describe("Tags to add, e.g. Work, or a company name such as Acme"),
 			},
 			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 		},
@@ -249,94 +237,6 @@ export function buildMcpServer(
 	);
 
 	server.registerTool(
-		"line_folder_move",
-		{
-			title: "Move LINE chats into a betterLINE folder",
-			description:
-				"Files one or more chats under a betterLINE folder (群組), or takes them out of their folder with folder null. " +
-				"A chat is in at most one folder, so this moves it out of any other. With create_folder, a folder that does not exist yet is made. " +
-				ORGANIZE_ONLY,
-			inputSchema: {
-				chat_ids: z.array(chatId).min(1).max(100).describe("Chats to move"),
-				folder: folderName.nullable().describe("Folder name (see line_list_folders), or null to take the chats out of their folder"),
-				create_folder: z.boolean().default(false).describe("Make the folder if there is none by that name"),
-			},
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-		},
-		({ chat_ids, folder, create_folder }) =>
-			run(async () => {
-				allow(...chat_ids);
-				const ops: FolderOp[] = [];
-				let folderId: string | null = null;
-				if (folder !== null) {
-					folderId = organizer.folderNamed(folder)?.id ?? null;
-					if (!folderId) {
-						if (!create_folder) folderNamed(organizer, folder, " Pass create_folder to make it.");
-						folderId = randomUUID();
-						ops.push({ op: "create", folder_id: folderId, name: folder });
-					}
-				}
-				ops.push({ op: "move", chat_ids: [...new Set(chat_ids)], folder_id: folderId });
-				organizer.changeFolders(ops);
-				return chatsWithFolders(chat_ids);
-			}),
-	);
-
-	server.registerTool(
-		"line_folder_edit",
-		{
-			title: "Create, rename or reorder a betterLINE folder",
-			description:
-				"Changes one betterLINE folder (群組): rename_to renames it, position moves it in the sidebar (1 is the top), " +
-				"and create makes it (empty) when there is none by that name. " + ORGANIZE_ONLY,
-			inputSchema: {
-				folder: folderName.describe("Folder name (see line_list_folders)"),
-				create: z.boolean().default(false).describe("Make the folder if there is none by that name"),
-				rename_to: folderName.optional().describe("New name"),
-				position: z.number().int().min(1).max(100).optional().describe("Place in the sidebar, 1 is the top"),
-			},
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-		},
-		({ folder, create, rename_to, position }) =>
-			run(async () => {
-				const ops: FolderOp[] = [];
-				let id = organizer.folderNamed(folder)?.id;
-				if (!id) {
-					if (!create) folderNamed(organizer, folder, " Pass create to make it.");
-					id = randomUUID();
-					ops.push({ op: "create", folder_id: id, name: folder });
-				} else if (rename_to === undefined && position === undefined) {
-					throw new Error("Nothing to change: pass rename_to or position.");
-				}
-				if (rename_to !== undefined) {
-					const other = organizer.folderNamed(rename_to);
-					if (other && other.id !== id) throw new Error(`There is already a folder named "${other.name}".`);
-					ops.push({ op: "rename", folder_id: id, name: rename_to });
-				}
-				if (position !== undefined) ops.push({ op: "position", folder_id: id, index: position - 1 });
-				organizer.changeFolders(ops);
-				return { folders: folderSummary() };
-			}),
-	);
-
-	server.registerTool(
-		"line_folder_delete",
-		{
-			title: "Delete a betterLINE folder",
-			description:
-				"Deletes a betterLINE folder (群組). Its chats go back to the main chat list; no chat or message is deleted. " + ORGANIZE_ONLY,
-			inputSchema: { folder: folderName.describe("Folder name (see line_list_folders)") },
-			annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-		},
-		({ folder }) =>
-			run(async () => {
-				const found = folderNamed(organizer, folder);
-				organizer.changeFolders([{ op: "delete", folder_id: found.id }]);
-				return { deleted: found.name, chats_moved_out: found.chat_ids.filter(visible).length, folders: folderSummary() };
-			}),
-	);
-
-	server.registerTool(
 		"line_hide_chats",
 		{
 			title: "Hide LINE chats in betterLINE",
@@ -353,35 +253,8 @@ export function buildMcpServer(
 				const ids = [...new Set(chat_ids)];
 				const names = await line.chatNames(ids).catch(() => new Map<string, string>());
 				const chats = ids.map((id) => ({ chat_id: id, name: names.get(id) ?? "" }));
-				organizer.changeFolders([{ op: "hide", chats }]);
+				organizer.hide(chats);
 				return { hidden: chats, note: "The owner can unhide them in betterLINE → Settings → 聊天室." };
-			}),
-	);
-
-	server.registerTool(
-		"line_list_folders",
-		{
-			title: "List betterLINE folders",
-			description:
-				"Lists the folders the owner sorts chats into in the betterLINE desktop app (the app calls them 群組), " +
-				"with every chat in each, including chats with no messages in the last 14 days.",
-			annotations: { readOnlyHint: true, openWorldHint: true },
-		},
-		() =>
-			run(async () => {
-				const state = organizer.state();
-				const folders = state.folders.map((f) => ({ ...f, chat_ids: f.chat_ids.filter(visible) }));
-				const names = await line.chatNames(folders.flatMap((f) => f.chat_ids));
-				return {
-					folders: folders.map((f) => ({
-						name: f.name,
-						chats: f.chat_ids.map((id) => ({ chat_id: id, name: names.get(id), type: chatType(id) })),
-					})),
-					...(state.updated_ms ? { updated: formatTime(state.updated_ms) } : {}),
-					...(state.folders.length || state.updated_ms
-						? {}
-						: { note: "The owner has no folders yet. Make one with line_folder_move or line_folder_edit when they ask." }),
-				};
 			}),
 	);
 
@@ -838,25 +711,53 @@ export function buildMcpServer(
 			}),
 	);
 
+	/** A listener's tags with the chats that have them now; a tag no chat has any more has none. */
+	const listenedTags = (names: string[] = []) =>
+		names.map((name) => {
+			const tag = organizer.tagNamed(name);
+			const chat_ids = tag ? organizer.tagList().find((t) => t.name === tag)!.chat_ids.filter(visible) : [];
+			return { tag: tag ?? name, chat_ids, ...(chat_ids.length ? {} : { note: "No chat has this tag now." }) };
+		});
+
 	server.registerTool(
 		"line_listen_set",
 		{
 			title: "Listen to LINE chats",
 			description:
-				"Registers a webhook for one or more chats: every new message someone else sends in them is POSTed to url as JSON " +
-				"{text, listener, chat_id, message: {id, from_id, from_name, kind, text, time}}. Setting an existing name replaces that listener.",
+				"Registers a webhook for chats, tags, or both: every new message someone else sends in them is POSTed to url as JSON " +
+				"{text, listener, chat_id, message: {id, from_id, from_name, kind, text, time}}. " +
+				"A tag is followed as it changes: a chat tagged later is heard from, one untagged is not, and renaming the tag keeps the listener. " +
+				"Each message is posted once, even if its chat is listed and has a listened tag. Setting an existing name replaces that listener; " +
+				"omitting headers then keeps its headers, and headers: {} clears them. Header values are only ever shown masked.",
 			inputSchema: {
 				name: z.string().min(1).max(100).describe("Name for this listener, e.g. your agent's name"),
 				url: z.string().url().describe("Webhook to POST each new message to"),
-				chats: z.array(chatId).min(1).max(100).describe("Chats to listen to"),
-				headers: z.record(z.string(), z.string()).optional().describe("Request headers the webhook needs, e.g. Authorization"),
+				chats: z.array(chatId).max(100).optional().describe("Chats to listen to"),
+				tags: z
+					.array(z.string().trim().min(1).max(40))
+					.max(20)
+					.optional()
+					.describe("Tags to listen to (see line_list_tags): every chat with any of them"),
+				headers: z
+					.record(z.string(), z.string())
+					.optional()
+					.describe("Request headers the webhook needs, e.g. Authorization. Omit to keep a replaced listener's headers; {} clears them"),
 			},
 			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
 		},
-		({ name, url, chats, headers }) =>
+		({ name, url, chats = [], tags = [], headers }) =>
 			run(async () => {
+				if (!chats.length && !tags.length) throw new Error("Give chats, tags or both to listen to.");
 				allow(...chats);
-				return listeners.set({ name, url, chats: [...new Set(chats)], headers: headers ?? {} });
+				const tagList = tagsNamed(tags);
+				const listener = listeners.set({
+					name,
+					url,
+					chats: [...new Set(chats)],
+					...(tagList.length ? { tags: [...new Set(tagList)] } : {}),
+					headers: headers ?? listeners.list().find((l) => l.name === name)?.headers ?? {},
+				});
+				return { ...listener, headers: maskHeaders(listener.headers), tags: listenedTags(listener.tags) };
 			}),
 	);
 
@@ -864,14 +765,19 @@ export function buildMcpServer(
 		"line_listen_list",
 		{
 			title: "List LINE listeners",
-			description: "Lists the registered listeners: name, webhook and the chats each listens to.",
+			description: "Lists the registered listeners: name, webhook, header names with masked values, the chats each listens to, and its tags with the chats that have them now.",
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		() =>
 			run(async () => {
 				const all = listeners.list();
 				const names = await line.chatNames([...new Set(all.flatMap((l) => l.chats))]).catch(() => new Map<string, string>());
-				return all.map((l) => ({ ...l, chats: l.chats.map((id) => ({ chat_id: id, name: names.get(id) })) }));
+				return all.map((l) => ({
+					...l,
+					headers: maskHeaders(l.headers ?? {}),
+					chats: l.chats.map((id) => ({ chat_id: id, name: names.get(id) })),
+					tags: listenedTags(l.tags),
+				}));
 			}),
 	);
 
@@ -887,15 +793,6 @@ export function buildMcpServer(
 	);
 
 	return server;
-}
-
-function folderNamed(organizer: Organizer, name: string, hint = "") {
-	const folder = organizer.folderNamed(name);
-	if (folder) return folder;
-	const names = organizer.state().folders.map((f) => f.name);
-	throw new Error((names.length
-		? `No folder named "${name}". The owner's folders: ${names.join(", ")}.`
-		: "The owner has no folders in betterLINE.") + hint);
 }
 
 /** A message's media from the shared cache (also used by the desktop client), downloading it once. */

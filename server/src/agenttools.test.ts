@@ -10,7 +10,6 @@ const amy = "u" + "a".repeat(32);
 const bob = "u" + "b".repeat(32);
 const cat = "u" + "d".repeat(32);
 const team = "c" + "c".repeat(32);
-const work = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 
 async function* chunks(...parts: string[]) {
 	for (const part of parts) yield new TextEncoder().encode(part);
@@ -57,7 +56,6 @@ test("agents can do what the owner does in betterLINE", async () => {
 		readMarkers: async () => ({ [bob]: "490" }),
 	};
 	const organizer = new Organizer(join(process.env.LINE_MCP_STATE_DIR, "organizer.json"));
-	organizer.replace({ folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [] });
 	const uploads = new Uploads(join(process.env.LINE_MCP_STATE_DIR, "uploads"));
 	const server = buildMcpServer(line as never, {} as never, {} as never, organizer, {} as never, uploads);
 	const client = new Client({ name: "test", version: "1" });
@@ -68,30 +66,6 @@ test("agents can do what the owner does in betterLINE", async () => {
 		const text = (result.content as { text: string }[])[0].text;
 		return { error: result.isError === true, text, json: () => JSON.parse(text) };
 	};
-	const layout = () => organizer.state().folders.map((f) => [f.name, f.chat_ids]);
-
-	// Folders: the one thing Courier could not do.
-	const unknown = await call("line_folder_move", { chat_ids: [bob], folder: "Clubs" });
-	assert.ok(unknown.error);
-	assert.match(unknown.text, /The owner's folders: Work\. Pass create_folder/);
-	const moved = (await call("line_folder_move", { chat_ids: [bob, team], folder: "work" })).json();
-	assert.deepEqual(moved.chats.map((c: { folder: string }) => c.folder), ["Work", "Work"]);
-	await call("line_folder_move", { chat_ids: [team], folder: "社團", create_folder: true });
-	assert.deepEqual(layout(), [["Work", [amy, bob]], ["社團", [team]]]);
-	await call("line_folder_move", { chat_ids: [bob], folder: null });
-	assert.deepEqual(layout(), [["Work", [amy]], ["社團", [team]]]);
-
-	assert.match((await call("line_folder_edit", { folder: "社團", rename_to: "work" })).text, /already a folder named "Work"/);
-	assert.match((await call("line_folder_edit", { folder: "社團" })).text, /Nothing to change/);
-	const edited = (await call("line_folder_edit", { folder: "社團", rename_to: "Clubs", position: 1 })).json();
-	assert.deepEqual(edited.folders, [{ name: "Clubs", chats: 1 }, { name: "Work", chats: 1 }]);
-	await call("line_folder_edit", { folder: "Family", create: true, position: 2 });
-	assert.deepEqual(layout(), [["Clubs", [team]], ["Family", []], ["Work", [amy]]]);
-	const deleted = (await call("line_folder_delete", { folder: "clubs" })).json();
-	assert.deepEqual([deleted.deleted, deleted.chats_moved_out], ["Clubs", 1]);
-	assert.equal(organizer.folderOf(team), undefined);
-	const listed = (await call("line_list_folders")).json();
-	assert.deepEqual(listed.folders.map((f: { name: string }) => f.name), ["Family", "Work"]);
 
 	// Tags: rename and delete, like Settings → 聊天室.
 	await call("line_tag_add", { chat_ids: [amy, bob], tags: ["讀書會"] });
@@ -145,7 +119,7 @@ test("agents can do what the owner does in betterLINE", async () => {
 	assert.equal(organizer.isHidden(bob), true);
 	for (const [name, args] of [
 		["line_hide_chats", { chat_ids: [bob] }],
-		["line_folder_move", { chat_ids: [bob], folder: "Work" }],
+		["line_tag_add", { chat_ids: [bob], tags: ["Work"] }],
 		["line_send_sticker", { chat_id: bob, package_id: "1", sticker_id: "2" }],
 		["line_react", { chat_id: bob, message_id: "1", reaction: "NICE" }],
 		["line_unsend", { chat_id: bob, message_id: "1" }],

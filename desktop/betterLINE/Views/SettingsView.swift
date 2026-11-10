@@ -66,38 +66,12 @@ private struct GeneralSettings: View {
 	}
 }
 
-/// Chat groups (sidebar sections), tags and hidden chats.
+/// Tags and hidden chats.
 private struct ChatsSettings: View {
 	@Environment(AppModel.self) private var app
 
 	var body: some View {
 		Form {
-			Section {
-				if app.organizer.groups.isEmpty {
-					Text("還沒有群組。在側邊欄的聊天室上按右鍵，選「移到群組」→「新增群組…」。")
-						.foregroundStyle(.secondary)
-				}
-				ForEach(app.organizer.groups) { group in
-					HStack {
-						Text(group.name)
-						Spacer()
-						Text("\(memberCount(group)) 個聊天室").foregroundStyle(.secondary)
-						Button("重新命名…") { app.promptRename(group) }
-						Button(role: .destructive) {
-							app.organizer.delete(group.id)
-						} label: {
-							Image(systemName: "trash")
-						}
-						.help("刪除群組（聊天室會回到「其他」）")
-					}
-				}
-				.onMove { app.organizer.moveGroups(from: $0, to: $1) }
-				Button("新增群組…") { app.promptNewGroup() }
-			} header: {
-				Text("群組")
-			} footer: {
-				Text("群組會在側邊欄顯示成可收合的區塊，可以拖移調整順序。")
-			}
 			Section {
 				if app.organizer.allTags.isEmpty {
 					Text("還沒有標籤。在側邊欄的聊天室上按右鍵，選「標籤」→「新增標籤…」。")
@@ -121,7 +95,7 @@ private struct ChatsSettings: View {
 			} header: {
 				Text("標籤")
 			} footer: {
-				Text("一個聊天室可以有多個標籤，例如所屬的公司。在側邊欄上方可以依標籤篩選。標籤存在伺服器上，Claude 也能讀取和修改。")
+				Text("一個聊天室可以有多個標籤，例如 Work 或所屬的公司。側邊欄上方會列出所有標籤，點一下就只顯示那個標籤的聊天室。標籤存在伺服器上，Claude 也能讀取和修改。")
 			}
 			Section {
 				if app.organizer.hidden.isEmpty {
@@ -144,12 +118,7 @@ private struct ChatsSettings: View {
 		}
 		.formStyle(.grouped)
 		.frame(minHeight: 460)
-		.groupPrompt(app)
 		.tagPrompt(app)
-	}
-
-	private func memberCount(_ group: Organizer.Group) -> Int {
-		app.organizer.membership.values.filter { $0 == group.id }.count
 	}
 }
 

@@ -179,63 +179,48 @@ struct OrganizerTests {
 		return Organizer(defaults: defaults)
 	}
 
-	@Test func groupsAndMembership() throws {
-		let organizer = fresh()
-		#expect(organizer.addGroup(named: "  ") == nil)
-		let work = try #require(organizer.addGroup(named: " 工作 "))
-		let family = try #require(organizer.addGroup(named: "家人"))
-		#expect(work.name == "工作")
-		organizer.assign("u1", to: work.id)
-		organizer.assign("u2", to: family.id)
-		#expect(organizer.group(of: "u1") == work)
-		organizer.move(family.id, by: -1)
-		#expect(organizer.groups.map(\.name) == ["家人", "工作"])
-		organizer.delete(family.id)
-		#expect(organizer.group(of: "u2") == nil, "deleting a group ungroups its chats")
-		organizer.assign("u1", to: nil)
-		#expect(organizer.group(of: "u1") == nil)
-	}
-
 	@Test func hiddenChatsPersist() throws {
 		let defaults = MemoryDefaults()
 		let organizer = Organizer(defaults: defaults)
-		let group = try #require(organizer.addGroup(named: "朋友"))
-		organizer.assign("c9", to: group.id)
 		organizer.hide("u7", name: "某人")
-		organizer.setCollapsed(group.id, true)
 
 		let reloaded = Organizer(defaults: defaults)
 		#expect(reloaded.isHidden("u7"))
 		#expect(reloaded.hidden["u7"] == "某人")
-		#expect(reloaded.group(of: "c9")?.name == "朋友")
-		#expect(reloaded.collapsed.contains(group.id))
 		reloaded.unhide("u7")
 		#expect(!Organizer(defaults: defaults).isHidden("u7"))
 	}
 
+	@Test func groupsFromAnOlderBuildBecomeTags() throws {
+		let defaults = MemoryDefaults()
+		let work = UUID(), empty = UUID()
+		let stored = #"""
+		{"groups":[{"id":"\#(work.uuidString)","name":" Work "},{"id":"\#(empty.uuidString)","name":"空的"}],
+		 "membership":{"u1":"\#(work.uuidString)","c2":"\#(work.uuidString)"},
+		 "hidden":{"u9":"某人"},"collapsed":["\#(work.uuidString)"],"synced":true,"dirty":false,
+		 "serverTags":{"u1":["讀書會"]},"foldersRev":7}
+		"""#
+		defaults.set(Data(stored.utf8), forKey: "organizer")
+
+		let organizer = Organizer(defaults: defaults)
+		#expect(organizer.isHidden("u9"))
+		#expect(organizer.hiddenRev == 7)
+		#expect(organizer.pendingTagOps.map(\.tags) == [["Work"]])
+		#expect(organizer.pendingTagOps.first?.chatIds == ["c2", "u1"])
+		#expect(organizer.tags(of: "u1") == ["讀書會", "Work"].sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+		#expect(organizer.tags(of: "c2") == ["Work"])
+		#expect(Organizer(defaults: defaults).pendingTagOps.count == 1, "it happens once")
+	}
+
 	@Test func firstSyncKeepsBothSides() throws {
 		let organizer = fresh()
-		let work = try #require(organizer.addGroup(named: "work"))
-		let gym = try #require(organizer.addGroup(named: "健身"))
-		organizer.assign("u1", to: work.id)
-		organizer.assign("u2", to: work.id)
-		organizer.assign("u3", to: gym.id)
 		organizer.hide("u9", name: "某人")
-		let serverWork = UUID()
-		let server = OrganizerState(
-			folders: [.init(id: serverWork, name: "Work", chatIds: ["u2", "u4"])],
-			hidden: [.init(chatId: "u8", name: "別人")],
-			updatedMs: 1,
-		)
+		let server = OrganizerState(hidden: [.init(chatId: "u8", name: "別人")], updatedMs: 1)
 
 		let push = try #require(organizer.reconcile(with: server))
 		#expect(organizer.synced)
-		#expect(organizer.groups.map(\.name) == ["Work", "健身"], "same-named groups merge into the server's")
-		#expect(organizer.group(of: "u1")?.id == serverWork)
-		#expect(organizer.group(of: "u4")?.id == serverWork)
-		#expect(organizer.group(of: "u3")?.name == "健身")
 		#expect(organizer.isHidden("u8") && organizer.isHidden("u9"))
-		#expect(push.folders.map(\.chatIds) == [["u1", "u2", "u4"], ["u3"]])
+		#expect(push.hidden.map(\.chatId) == ["u8", "u9"])
 
 		organizer.markSaved(push, server: push)
 		#expect(!organizer.dirty)
@@ -243,14 +228,13 @@ struct OrganizerTests {
 
 	@Test func laterSyncsFollowTheServerUnlessChangedHere() throws {
 		let organizer = fresh()
-		let empty = OrganizerState(folders: [], hidden: [], updatedMs: 0)
+		let empty = OrganizerState(hidden: [], updatedMs: 0)
 		#expect(organizer.reconcile(with: empty) == nil, "nothing to send when both sides are empty")
 		var pushes = 0
 		organizer.onChange = { pushes += 1 }
 
-		let fromOtherMac = OrganizerState(folders: [.init(id: UUID(), name: "家人", chatIds: ["c1"])], hidden: [.init(chatId: "u5", name: "x")])
+		let fromOtherMac = OrganizerState(hidden: [.init(chatId: "u5", name: "x")])
 		#expect(organizer.reconcile(with: fromOtherMac) == nil)
-		#expect(organizer.group(of: "c1")?.name == "家人")
 		#expect(organizer.isHidden("u5"))
 		#expect(pushes == 0, "applying the server's copy is not a local change")
 
@@ -269,45 +253,39 @@ struct OrganizerTests {
 	@Test func savesCarryTheRevisionAndTakeBackAgentChanges() throws {
 		let defaults = MemoryDefaults()
 		let organizer = Organizer(defaults: defaults)
-		let work = UUID()
-		let server = OrganizerState(folders: [.init(id: work, name: "Work", chatIds: ["u1"])], hidden: [], rev: 5)
+		let server = OrganizerState(hidden: [], rev: 5)
 		#expect(organizer.reconcile(with: server) == nil)
-		#expect(organizer.foldersRev == 5)
+		#expect(organizer.hiddenRev == 5)
 
-		// Offline: the owner files u2 while an agent files u3 and hides u4 on the server.
-		organizer.assign("u2", to: work)
-		let push = try #require(organizer.reconcile(with: OrganizerState(folders: [.init(id: work, name: "Work", chatIds: ["u1", "u3"])], hidden: [], rev: 6)))
-		#expect(organizer.foldersRev == 5, "a save from here is based on what this Mac last took from the server")
-		#expect(push.folders[0].chatIds == ["u1", "u2"])
+		// Offline: the owner hides u2 while an agent hides u4 on the server.
+		organizer.hide("u2", name: "某人")
+		let push = try #require(organizer.reconcile(with: OrganizerState(hidden: [.init(chatId: "u4", name: "別人")], rev: 6)))
+		#expect(organizer.hiddenRev == 5, "a save from here is based on what this Mac last took from the server")
+		#expect(push.hidden.map(\.chatId) == ["u2"])
 
-		// The server replays the agent's changes on top of the save.
-		let saved = OrganizerState(
-			folders: [.init(id: work, name: "Work", chatIds: ["u1", "u2", "u3"])],
-			hidden: [.init(chatId: "u4", name: "某人")],
-			rev: 7,
-		)
+		// The server replays the agent's hide on top of the save.
+		let saved = OrganizerState(hidden: [.init(chatId: "u2", name: "某人"), .init(chatId: "u4", name: "別人")], rev: 7)
 		organizer.markSaved(push, server: saved)
 		#expect(!organizer.dirty)
-		#expect(organizer.group(of: "u3")?.id == work)
 		#expect(organizer.isHidden("u4"))
-		#expect(organizer.foldersRev == 7)
-		#expect(Organizer(defaults: defaults).foldersRev == 7)
+		#expect(organizer.hiddenRev == 7)
+		#expect(Organizer(defaults: defaults).hiddenRev == 7)
 	}
 
 	@Test func saveBodyNamesTheBaseRevision() throws {
-		let save = OrganizerSave(folders: [], hidden: [], baseRev: 12)
+		let save = OrganizerSave(hidden: [], baseRev: 12)
 		let body = try #require(String(data: JSONEncoder.api.encode(save), encoding: .utf8))
 		#expect(body.contains(#""base_rev":12"#))
 		#expect(!body.contains("tags"))
+		#expect(!body.contains("folders"))
 	}
 
 	@Test func organizerWireFormat() throws {
-		let id = UUID()
-		let state = OrganizerState(folders: [.init(id: id, name: "Work", chatIds: ["u1"])], hidden: [.init(chatId: "u2", name: "某人")])
+		let state = OrganizerState(hidden: [.init(chatId: "u2", name: "某人")])
 		let body = try #require(String(data: JSONEncoder.api.encode(state), encoding: .utf8))
-		#expect(body.contains(#""chat_ids":["u1"]"#))
 		#expect(body.contains(#""chat_id":"u2""#))
-		let served = try JSONDecoder.api.decode(OrganizerState.self, from: Data(#"{"folders":[{"id":"\#(id.uuidString.lowercased())","name":"Work","chat_ids":["u1"]}],"hidden":[{"chat_id":"u2","name":"某人"}],"updated_ms":5}"#.utf8))
+		// The server still sends an empty `folders` for builds from before tags replaced them.
+		let served = try JSONDecoder.api.decode(OrganizerState.self, from: Data(#"{"folders":[],"hidden":[{"chat_id":"u2","name":"某人"}],"updated_ms":5}"#.utf8))
 		#expect(served.sameContent(as: state))
 		#expect(served.updatedMs == 5)
 		let event = try JSONDecoder.api.decode(LineEvent.self, from: Data(#"{"type":"organizer"}"#.utf8))
@@ -322,7 +300,7 @@ struct TagTests {
 	}
 
 	private func state(rev: Int, _ tags: [String: [String]]) -> OrganizerState {
-		OrganizerState(folders: [], hidden: [], tags: tags.map { .init(chatId: $0.key, tags: $0.value) }, rev: rev)
+		OrganizerState(hidden: [], tags: tags.map { .init(chatId: $0.key, tags: $0.value) }, rev: rev)
 	}
 
 	@Test func severalTagsPerChatAndOneTagPerSpelling() {
@@ -398,7 +376,7 @@ struct TagTests {
 	@Test func aServerOlderThanTagsKeepsChangesQueued() {
 		let organizer = fresh()
 		organizer.addTags(["讀書會"], to: ["u1"])
-		organizer.receiveTags(OrganizerState(folders: [], hidden: [], updatedMs: 1))
+		organizer.receiveTags(OrganizerState(hidden: [], updatedMs: 1))
 		#expect(organizer.tags(of: "u1") == ["讀書會"])
 		#expect(organizer.pendingTagOps.count == 1)
 	}

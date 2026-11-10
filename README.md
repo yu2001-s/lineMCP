@@ -35,13 +35,10 @@ The commands below use `linebox` as the SSH alias of the machine running the ser
 | Tool | Notes |
 |---|---|
 | `line_get_status` | Session state and account |
-| `line_list_chats` | Recent chats with unread counts, last message, betterLINE folder and tags. `folder` limits it to one folder, `tags` to chats with any (or with `match_all_tags`, all) of those tags |
-| `line_list_folders` | The owner's betterLINE folders (群組) with every chat in each, including chats quiet for over 14 days |
-| `line_list_tags` | The tags on the owner's chats (e.g. a company, Acme) with every chat that has each, including chats quiet for over 14 days |
+| `line_list_chats` | Recent chats with unread counts, last message and tags. `tags` limits it to chats with any (or with `match_all_tags`, all) of those tags |
+| `line_list_tags` | The tags on the owner's chats (e.g. Work, or a company, Acme) with every chat that has each, including chats quiet for over 14 days |
 | `line_tag_add` / `line_tag_remove` | Add or remove tags on one or more chats. A name matching an existing tag (ignoring case and Simplified/Traditional Chinese) is that tag |
 | `line_tag_rename` / `line_tag_delete` | Rename a tag on every chat (renaming onto another tag merges them), or take it off every chat, as Settings → 聊天室 does |
-| `line_folder_move` | Move chats into a folder (`create_folder` makes it), or out of their folder with `folder: null` |
-| `line_folder_edit` / `line_folder_delete` | Create, rename or reorder a folder; delete one (its chats go back to the main list) |
 | `line_hide_chats` | Hide chats (隱藏聊天室). They then leave every tool too, so only the owner can unhide them, in betterLINE |
 | `line_read_messages` | Chronological history with paging (`older_cursor`). LINE only serves the last 14 days to a secondary device. Stickers carry the ids `line_send_sticker` needs, and messages list their reactions. Unsent messages come back as `unsent: true` with no text, since LINE keeps none; edited ones (a LYP Premium feature) as `edited: true` with `edited_at` and the edited text |
 | `line_search_contacts` | Friends and groups by name |
@@ -61,8 +58,8 @@ The commands below use `linebox` as the SSH alias of the machine running the ser
 | `line_archive_sync` | Sync archived chats now instead of waiting for the daily run |
 | `line_read_archive` | Read an archived chat from the local copy, including messages older than 14 days |
 | `line_search_messages` | Substring search over archived chats (works for Chinese); `tags` limits it to chats with those tags |
-| `line_listen_set` / `line_listen_remove` | Register or remove a webhook for one or more chats; every new message from someone else in them is POSTed to it |
-| `line_listen_list` | Registered listeners, their webhooks and chats |
+| `line_listen_set` / `line_listen_remove` | Register or remove a webhook for chats and/or tags; every new message from someone else in them is POSTed to it |
+| `line_listen_list` | Registered listeners, their webhooks, chats and tags (with the chats that have each now) |
 
 Reading does **not** mark chats as read and sends no read receipts.
 
@@ -70,15 +67,17 @@ Chats hidden in betterLINE (隱藏聊天室) are left out of every listing and s
 
 Agents can do what the owner does in betterLINE except unhide a chat, which would mean showing them the chats the owner hid from them. The server instructions and tool descriptions tell agents to organise chats, react, unsend or mark read only when the owner asks.
 
-## Folders
+## Hidden chats
 
-Folders (the app's 群組) and hidden chats are the desktop app's: each Mac saves its whole copy with `PUT /api/organizer`. Agents change them one small operation at a time (create, rename, move in the sidebar, delete, move chats, hide), which the server applies at once and also keeps, with the revision each made, in `organizer.json` (the last 1,000). A Mac's save says which revision its copy is based on (`base_rev`), and the server replays every agent change after it on top, so a Mac that was offline or mid-edit does not undo what an agent did; a change to a folder the Mac deleted meanwhile does nothing, and a folder an agent made merges into one of the same name the Mac made. The reply is the result, which the Mac takes as its own. Builds of betterLINE older than this send no `base_rev`, and their saves overwrite agents' changes as before.
+Each Mac saves its whole copy of hidden chats with `PUT /api/organizer`. Agents hide chats with `line_hide_chats`, which the server applies at once and also keeps, with the revision each made, in `organizer.json` (the last 1,000). A Mac's save says which revision its copy is based on (`base_rev`), and the server replays every agent hide after it on top, so a Mac that was offline or mid-edit does not undo what an agent did. The reply is the result, which the Mac takes as its own.
 
 ## Tags
 
-A chat can have any number of tags, such as the company a contact works at. The owner adds and removes them in betterLINE, and agents with `line_tag_add` / `line_tag_remove`; the server instructions tell agents that tags are the owner's organisation, to change them only when the owner asks, and never to take a tag name from a LINE message.
+A chat can have any number of tags, such as Work or the company a contact works at. Tags are the only way chats are sorted: betterLINE shows the chats by tag, and agents filter and listen by tag. The owner adds and removes them in betterLINE, and agents with `line_tag_add` / `line_tag_remove`; the server instructions tell agents that tags are the owner's organisation, to change them only when the owner asks, and never to take a tag name from a LINE message.
 
-Tags live on the server (`organizer.json`, next to folders and hidden chats), which is the only copy both sides write. They change only through small operations — add these tags to these chats, remove them, rename a tag, delete a tag — applied one after another, so an agent's change and the desktop's change to different chats or tags both survive. The desktop's save of its folders and hidden chats (`PUT /api/organizer`) never carries tags and leaves them alone. Every change bumps a revision number and sends an `organizer` event, so open betterLINE windows show an agent's tags right away.
+Tags live on the server (`organizer.json`, next to hidden chats), which is the only copy both sides write. They change only through small operations — add these tags to these chats, remove them, rename a tag, delete a tag — applied one after another, so an agent's change and the desktop's change to different chats or tags both survive. The desktop's save of its hidden chats (`PUT /api/organizer`) never carries tags and leaves them alone. Every change bumps a revision number and sends an `organizer` event, so open betterLINE windows show an agent's tags right away.
+
+Until 2026-11-10 chats could also be filed into one folder each (the app's 群組). Folders were dropped for tags: the server gave every chat in a folder a tag named after it, keeping its other tags (Work → tag "Work"), and a listener on a folder now listens to that tag. A Mac's own copy of its groups is turned into the same tags the first time a newer build starts. Older builds still get an empty `folders` list from `/api/organizer`, so they drop their groups instead of failing, and the folders they save are ignored.
 
 ## Archive
 
@@ -94,7 +93,7 @@ Agents send files they have locally (a PDF, a photo) in two steps: `line_create_
 
 ## Listeners
 
-An agent registers a webhook for one or more chats with `line_listen_set`. Every new message someone else sends in those chats is POSTed to the webhook as JSON:
+An agent registers a webhook for chats (`chats`), tags (`tags`, by name), or both with `line_listen_set`. Every new message someone else sends in those chats is POSTed to the webhook as JSON:
 
 ```json
 {
@@ -105,7 +104,9 @@ An agent registers a webhook for one or more chats with `line_listen_set`. Every
 }
 ```
 
-`headers` are sent with each POST (for example `Authorization`). The owner's own messages are not posted, so an agent's replies don't call its webhook. A failed POST (10 s timeout) is logged and not retried. Listeners are kept in `~/.local/state/line-mcp/listeners.json`.
+`headers` are sent with each POST (for example `Authorization`). They are stored in full but `line_listen_set` and `line_listen_list` only show them masked, e.g. `Bearer crsr_…a1b2` (a scheme, a token prefix and the last 4 characters; a secret under 12 characters shows as `••••`). Setting an existing listener again without `headers` keeps its headers, so an agent need not resend secrets; `headers: {}` clears them. The owner's own messages are not posted, so an agent's replies don't call its webhook. A failed POST (10 s timeout) is logged and not retried. A message is posted once per listener, even if its chat is both listed and has a listened tag.
+
+Tags are looked up when each message arrives: a chat tagged later is posted from then on, and one untagged stops, without setting the listener again. Renaming the tag (`line_tag_rename` or in betterLINE) renames it in the listener too. Hidden chats with the tag are not posted. An unknown tag is an error when the listener is set; a tag no chat has any more just stops matching, and `line_listen_list` says so. Listeners are kept in `~/.local/state/line-mcp/listeners.json`.
 
 ## Desktop client API
 
@@ -121,7 +122,7 @@ An agent registers a webhook for one or more chats with `line_listen_set`. Every
 | `POST /api/chats/:id/read`, `/api/messages/:id/unsend`, `/api/messages/:id/react` | Mark read, unsend, react |
 | `GET /api/media/:id?chat=&delivered=` | Decrypted media, cached owner-only in `~/.local/state/line-mcp/media-cache` (2 GB cap) |
 | `GET /api/search?q=`, `GET /api/archive`, `POST /api/archive/sync` | Archive search and status |
-| `GET /api/organizer`, `PUT /api/organizer` | Folders, hidden chats and tags, kept in `~/.local/state/line-mcp/organizer.json` for the MCP tools. The PUT replaces folders and hidden chats only, then replays agents' folder changes made after its `base_rev` (see [Folders](#folders)) |
+| `GET /api/organizer`, `PUT /api/organizer` | Hidden chats and tags, kept in `~/.local/state/line-mcp/organizer.json` for the MCP tools. The PUT replaces hidden chats only, then replays agents' hides made after its `base_rev` (see [Hidden chats](#hidden-chats)) |
 | `POST /api/organizer/tags` | Tag changes `{ops: [{op: "add" \| "remove", tags, chat_ids} \| {op: "rename", tags: [old], to} \| {op: "delete", tags: [old]}]}`, applied in order, all or none |
 | `GET /api/events` | Server-sent events: new messages, unsends, reads, reactions, session status, organizer changes (including tags set by agents) |
 
@@ -132,10 +133,9 @@ To turn it off, remove `LINE_CLIENT_HOST`/`LINE_CLIENT_KEY` from the env file an
 `desktop/` is a SwiftUI app (macOS 15+) for reading and writing LINE from the Mac over this API, laid out like Messages and in Traditional Chinese: chat list with unread badges, history that continues into the archive, text with replies, stickers seen in your chats, E2EE images/video/voice/files (drop, paste or attach), reactions, unsend, archive search with Simplified/Traditional folding, live updates, and notifications you can reply to.
 
 - **New chat (⌘N)** opens the address book: every friend and group, including ones with no messages in LINE's 14 days. The sidebar search lists matching contacts too.
-- **Groups**: right-click a chat → 移到群組 to file it under a collapsible sidebar section. Claude sees them as folders (`line_list_folders`) and files chats too (`line_folder_move`).
 - **Hidden chats**: right-click → 隱藏聊天室. A hidden chat leaves the list and search, stops counting toward the Dock badge and never notifies; Settings → 聊天室 opens or unhides it. The MCP tools leave it alone too.
-- **Tags**: right-click a chat → 標籤 to tick existing tags or add a new one; a chat can have several, shown under its last message. The filter button above the list shows only chats with any (or all) of the chosen tags. Settings → 聊天室 renames or deletes a tag on every chat. Claude reads and changes the same tags (`line_list_tags`, `line_tag_add`).
-- Groups and hidden chats are saved on the server, so every Mac and the MCP tools share them. The first time a Mac connects, its groups merge with the server's by name; after that the server's copy wins, except for changes made while offline, and agents' changes are added back on top of those. Which groups are collapsed stays per Mac.
+- **Tags**: right-click a chat → 標籤 to tick existing tags or add a new one; a chat can have several, shown under its last message. The tag bar above the list views chats by tag: click a tag (say Work) to see only its chats, with its unread count beside it; click it again or 全部 to see every chat; ⌘-click to view several tags at once. The filter button chooses whether several tags show chats with any or all of them. The view stays across launches. Settings → 聊天室 renames or deletes a tag on every chat. Claude reads and changes the same tags (`line_list_tags`, `line_tag_add`).
+- Hidden chats are saved on the server, so every Mac and the MCP tools share them. The first time a Mac connects, its hidden chats merge with the server's; after that the server's copy wins, except for changes made while offline, and agents' hides are added back on top of those.
 - Tags are the server's: each Mac shows the server's copy with its own unconfirmed changes on top. A change made offline is queued (it survives quitting) and sent in order on the next connect, on top of whatever agents changed meanwhile.
 - **Trackpad swipes**, as in Messages: two fingers left show every message's time; two fingers right on a bubble start a reply to it.
 - **Attachments**: paste (⌘V) a screenshot, a copied image or copied files, drop files or images on the window, or use **+** → 照片與檔案…

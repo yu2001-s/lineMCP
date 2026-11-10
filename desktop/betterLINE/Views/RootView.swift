@@ -59,7 +59,6 @@ private struct MainView: View {
 		.sheet(isPresented: $app.showingNewChat) {
 			NewChatSheet()
 		}
-		.groupPrompt(app)
 		.tagPrompt(app)
 	}
 }

@@ -29,7 +29,8 @@ archiveSync.start();
 const organizer = new Organizer(config.organizerPath);
 // Every Mac running betterLINE picks up changes, including tags an agent set.
 organizer.onChange = () => line.events.emit("event", { type: "organizer" });
-const listeners = new Listeners(config.listenersPath);
+const listeners = new Listeners(config.listenersPath, organizer);
+organizer.onTagRename = (from, to) => listeners.renameTag(from, to);
 listeners.watch(line.events);
 const uploads = new Uploads(config.uploadsDir);
 if (config.clientHost && config.clientKey.length >= 32) {

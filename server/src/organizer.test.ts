@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,61 +8,87 @@ import { Organizer, OrganizerInputError } from "./organizer.ts";
 const amy = "u" + "a".repeat(32);
 const bob = "u" + "b".repeat(32);
 const team = "c" + "c".repeat(32);
+const cat = "u" + "d".repeat(32);
+const gym = "11111111-2222-4333-8444-555555555555";
 const work = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 const family = "0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d";
 const path = () => join(mkdtempSync(join(tmpdir(), "line-organizer-")), "organizer.json");
 
 test("starts empty, then keeps what the client saved across restarts", () => {
 	const file = path();
-	assert.deepEqual(new Organizer(file).state(), { folders: [], hidden: [], tags: [], rev: 0, updated_ms: 0 });
-	new Organizer(file).replace({
-		folders: [{ id: work, name: " Work ", chat_ids: [amy, team] }],
-		hidden: [{ chat_id: bob, name: "Bob" }],
-	});
+	assert.deepEqual(new Organizer(file).state(), { hidden: [], tags: [], rev: 0, updated_ms: 0 });
+	new Organizer(file).replace({ hidden: [{ chat_id: bob, name: "Bob" }] });
 	assert.equal(statSync(file).mode & 0o777, 0o600);
 	const reloaded = new Organizer(file);
-	assert.equal(reloaded.folderOf(amy)?.name, "Work");
-	assert.equal(reloaded.folderOf(bob), undefined);
 	assert.ok(reloaded.isHidden(bob));
 	assert.ok(!reloaded.isHidden(amy));
 	assert.ok(reloaded.state().updated_ms > 0);
 });
 
-test("folders are found by name regardless of case and Chinese script", () => {
-	const o = new Organizer(path());
-	o.replace({ folders: [{ id: work, name: "Work", chat_ids: [] }, { id: family, name: "家人們", chat_ids: [] }], hidden: [] });
-	assert.equal(o.folderNamed("work")?.id, work);
-	assert.equal(o.folderNamed(" 家人们 ")?.id, family);
-	assert.equal(o.folderNamed("Wor"), undefined);
+test("folders in a file from before tags become tags, keeping every chat's other tags", () => {
+	const file = path();
+	writeFileSync(file, JSON.stringify({
+		folders: [
+			{ id: work, name: "Work", chat_ids: [amy, team] },
+			{ id: family, name: " 家人 ", chat_ids: [bob] },
+			{ id: gym, name: "Empty", chat_ids: [] },
+		],
+		hidden: [{ chat_id: cat, name: "Cat" }],
+		tags: [{ chat_id: amy, tags: ["讀書會"] }, { chat_id: cat, tags: ["work"] }],
+		rev: 14,
+		updated_ms: 5,
+		folder_ops: [{ rev: 6, op: { op: "move", chat_ids: [amy], folder_id: work } }],
+	}));
+	const o = new Organizer(file);
+	assert.deepEqual(o.state().tags, [
+		{ chat_id: amy, tags: ["work", "讀書會"] },
+		{ chat_id: bob, tags: ["家人"] },
+		{ chat_id: team, tags: ["work"] },
+		{ chat_id: cat, tags: ["work"] },
+	].sort((a, b) => a.chat_id.localeCompare(b.chat_id)), "an existing tag of the same name is that tag, as spelled");
+	assert.ok(o.isHidden(cat));
+	assert.ok(o.state().rev > 14);
+	assert.deepEqual([...o.migratedFolders], [[work, "Work"], [family, "家人"], [gym, "Empty"]]);
+	const stored = JSON.parse(readFileSync(file, "utf-8"));
+	assert.equal("folders" in stored, false);
+	assert.equal("folder_ops" in stored, false);
+	const again = new Organizer(file);
+	assert.equal(again.migratedFolders.size, 0, "it happens once");
+	assert.deepEqual(again.state(), o.state());
 });
 
-test("a chat filed twice stays in the first folder", () => {
+test("a chat hidden twice is listed once", () => {
 	const o = new Organizer(path());
-	const saved = o.replace({
-		folders: [{ id: work, name: "Work", chat_ids: [amy, amy] }, { id: family, name: "家人", chat_ids: [amy, bob] }],
-		hidden: [{ chat_id: bob, name: "Bob" }, { chat_id: bob, name: "Bob again" }],
-	});
-	assert.deepEqual(saved.folders.map((f) => f.chat_ids), [[amy], [bob]]);
+	const saved = o.replace({ hidden: [{ chat_id: bob, name: "Bob" }, { chat_id: bob, name: "Bob again" }] });
 	assert.equal(saved.hidden.length, 1);
 });
 
-test("bad bodies are rejected and change nothing", () => {
+test("an older app's folders are ignored; bad bodies are rejected and change nothing", () => {
 	const o = new Organizer(path());
-	o.replace({ folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [] });
-	for (const body of [
-		null,
-		{ folders: [] },
-		{ folders: [{ id: "not-a-uuid", name: "x", chat_ids: [] }], hidden: [] },
-		{ folders: [{ id: work, name: "  ", chat_ids: [] }], hidden: [] },
-		{ folders: [{ id: work, name: "x", chat_ids: ["../etc"] }], hidden: [] },
-		{ folders: [], hidden: [{ chat_id: 5 }] },
-	]) {
+	const saved = o.replace({ folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [{ chat_id: bob, name: "Bob" }] });
+	assert.deepEqual(Object.keys(saved).sort(), ["hidden", "rev", "tags", "updated_ms"]);
+	assert.deepEqual(saved.tags, []);
+	for (const body of [null, { folders: [] }, { hidden: [{ chat_id: 5 }] }, { hidden: [{ chat_id: "../etc" }] }]) {
 		assert.throws(() => o.replace(body), OrganizerInputError);
 	}
-	assert.equal(o.folderOf(amy)?.name, "Work");
+	assert.ok(o.isHidden(bob));
 });
 
-test("the MCP tools filter by folder and leave hidden chats alone", async () => {
+test("a save from a Mac that had not seen an agent's hide keeps it", () => {
+	const file = path();
+	const o = new Organizer(file);
+	const synced = o.replace({ hidden: [] });
+	o.hide([{ chat_id: cat, name: "Cat" }]);
+	// The Mac, offline meanwhile, hid bob.
+	const saved = o.replace({ hidden: [{ chat_id: bob, name: "Bob" }] }, synced.rev);
+	assert.deepEqual(saved.hidden.map((h) => h.chat_id), [bob, cat]);
+	// A Mac that has seen everything saves as it is: the owner's unhide sticks.
+	assert.deepEqual(o.replace({ hidden: [{ chat_id: bob, name: "Bob" }] }, saved.rev).hidden.map((h) => h.chat_id), [bob]);
+	assert.equal(JSON.parse(readFileSync(file, "utf-8")).hide_ops.length, 1);
+	assert.equal("hide_ops" in new Organizer(file).state(), false, "clients never see the log");
+});
+
+test("the MCP tools filter by tag and leave hidden chats alone", async () => {
 	process.env.LINE_MCP_STATE_DIR = mkdtempSync(join(tmpdir(), "line-mcp-"));
 	const { buildMcpServer } = await import("./mcp.ts");
 	const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
@@ -92,25 +118,27 @@ test("the MCP tools filter by folder and leave hidden chats alone", async () => 
 		return { error: result.isError === true, text, json: () => JSON.parse(text) };
 	};
 
-	assert.match((await call("line_list_folders")).text, /has no folders yet/);
-	assert.equal((await call("line_list_chats", { folder: "Work" })).error, true);
+	assert.match((await call("line_list_tags")).text, /No chats are tagged yet/);
+	assert.equal((await call("line_list_chats", { tags: ["Work"] })).error, true);
+	for (const gone of ["line_list_folders", "line_folder_move", "line_folder_edit", "line_folder_delete"]) {
+		assert.ok((await client.listTools()).tools.every((t) => t.name !== gone), gone);
+	}
 
-	organizer.replace({
-		folders: [{ id: work, name: "Work", chat_ids: [amy, bob] }, { id: family, name: "家人", chat_ids: [team] }],
-		hidden: [{ chat_id: bob, name: "Bob" }],
-	});
+	organizer.addTags([amy, bob], ["Work"]);
+	organizer.addTags([team, amy], ["家人"]);
+	organizer.replace({ hidden: [{ chat_id: bob, name: "Bob" }] });
 
 	const all = (await call("line_list_chats")).json();
-	assert.deepEqual(all.map((c: { chat_id: string; folder?: string }) => [c.chat_id, c.folder]), [[amy, "Work"], [team, "家人"]]);
-	const inWork = (await call("line_list_chats", { folder: "work", limit: 1 })).json();
+	assert.deepEqual(all.map((c: { chat_id: string; tags?: string[] }) => [c.chat_id, c.tags]), [[amy, ["Work", "家人"]], [team, ["家人"]]]);
+	assert.equal("folder" in all[0], false);
+	const inWork = (await call("line_list_chats", { tags: ["work"], limit: 5 })).json();
 	assert.deepEqual(inWork.map((c: { chat_id: string }) => c.chat_id), [amy]);
-	const unknown = await call("line_list_chats", { folder: "Gym" });
+	const unknown = await call("line_list_chats", { tags: ["Gym"] });
 	assert.ok(unknown.error);
 	assert.match(unknown.text, /Work, 家人/);
 
-	const folders = (await call("line_list_folders")).json();
-	assert.deepEqual(folders.folders[0], { name: "Work", chats: [{ chat_id: amy, name: `name of ${amy.slice(0, 3)}`, type: "user" }] });
-	assert.ok(folders.updated);
+	const tags = (await call("line_list_tags")).json();
+	assert.deepEqual(tags.tags[0], { name: "Work", chats: [{ chat_id: amy, name: `name of ${amy.slice(0, 3)}`, type: "user" }] });
 
 	assert.deepEqual((await call("line_search_contacts", { query: "b" })).json().map((c: { id: string }) => c.id), [amy]);
 	for (const [name, args] of [

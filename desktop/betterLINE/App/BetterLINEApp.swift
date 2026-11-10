@@ -43,8 +43,6 @@ struct ChatCommands: Commands {
 		CommandGroup(replacing: .newItem) {
 			Button("新聊天") { app.showingNewChat = true }
 				.keyboardShortcut("n")
-			Button("新增群組…") { app.promptNewGroup() }
-				.keyboardShortcut("n", modifiers: [.command, .shift])
 		}
 		CommandGroup(after: .textEditing) {
 			Button("搜尋") { app.searchRequests += 1 }

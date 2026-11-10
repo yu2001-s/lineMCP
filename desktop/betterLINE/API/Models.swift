@@ -247,15 +247,9 @@ struct SyncResults: Decodable, Sendable {
 	var results: [SyncResult]
 }
 
-/// The owner's folders, hidden chats and tags as the server keeps them
+/// The owner's hidden chats and tags as the server keeps them
 /// (`/api/organizer`), so the MCP tools can use them too.
 struct OrganizerState: Codable, Sendable, Equatable {
-	struct Folder: Codable, Sendable, Equatable {
-		var id: UUID
-		var name: String
-		var chatIds: [String]
-	}
-
 	struct HiddenChat: Codable, Sendable, Equatable {
 		var chatId: String
 		var name: String
@@ -266,7 +260,6 @@ struct OrganizerState: Codable, Sendable, Equatable {
 		var tags: [String]
 	}
 
-	var folders: [Folder]
 	var hidden: [HiddenChat]
 	/// Set by the server; 0 until a Mac has saved one.
 	var updatedMs: Int64?
@@ -276,15 +269,14 @@ struct OrganizerState: Codable, Sendable, Equatable {
 	/// Goes up with every change on the server.
 	var rev: Int?
 
-	/// Folders and hidden chats, the part this Mac saves.
+	/// Hidden chats, the part this Mac saves.
 	func sameContent(as other: OrganizerState) -> Bool {
-		folders == other.folders && hidden == other.hidden
+		hidden == other.hidden
 	}
 }
 
 /// The body of `PUT /api/organizer`.
 struct OrganizerSave: Encodable, Sendable {
-	var folders: [OrganizerState.Folder]
 	var hidden: [OrganizerState.HiddenChat]
 	var baseRev: Int
 }
@@ -346,7 +338,7 @@ enum LineEvent: Sendable {
 	case reaction(chatId: String, messageId: String?)
 	case chatUpdate(chatId: String)
 	case status(SessionStatus)
-	/// Folders or hidden chats changed, from this Mac or another one.
+	/// Hidden chats or tags changed, from this Mac, another one or an agent.
 	case organizer
 	case unknown
 }

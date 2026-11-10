@@ -1,10 +1,9 @@
 import Foundation
 
-/// The owner's own arrangement of chats: named groups shown as sidebar
-/// sections, chats hidden everywhere (list, search, Dock badge,
-/// notifications) until unhidden in Settings, and any number of tags per
-/// chat. Groups and hidden chats are mirrored to the server so the MCP tools
-/// see them too; which groups are collapsed stays on this Mac.
+/// The owner's own arrangement of chats: chats hidden everywhere (list,
+/// search, Dock badge, notifications) until unhidden in Settings, and any
+/// number of tags per chat, by which the sidebar shows chats. Hidden chats
+/// are mirrored to the server so the MCP tools see them too.
 ///
 /// Tags live on the server, which agents change too. This Mac keeps the
 /// server's last copy and the changes it made that the server has not
@@ -12,24 +11,15 @@ import Foundation
 @MainActor
 @Observable
 final class Organizer {
-	struct Group: Codable, Identifiable, Hashable {
-		var id: UUID
-		var name: String
-	}
-
-	private(set) var groups: [Group] = []
-	/// chatId → group id.
-	private(set) var membership: [String: UUID] = [:]
 	/// chatId → chat name at the time it was hidden, for the Settings list.
 	private(set) var hidden: [String: String] = [:]
-	private(set) var collapsed: Set<UUID> = []
-	/// This Mac has merged its groups with the server's once.
+	/// This Mac has merged its hidden chats with the server's once.
 	private(set) var synced = false
 	/// Changes made here that the server does not have yet.
 	private(set) var dirty = false
-	/// The server revision whose agent changes to groups and hidden chats this
-	/// Mac has. Sent with a save, so the server adds the ones made after it.
-	private(set) var foldersRev = 0
+	/// The server revision whose agent hides this Mac has. Sent with a save,
+	/// so the server adds the ones made after it.
+	private(set) var hiddenRev = 0
 	/// Called after a change the server should get.
 	@ObservationIgnored var onChange: (() -> Void)?
 
@@ -47,94 +37,52 @@ final class Organizer {
 	private static let key = "organizer"
 
 	private struct Stored: Codable {
-		var groups: [Group]
-		var membership: [String: UUID]
 		var hidden: [String: String]
-		var collapsed: Set<UUID>
 		var synced: Bool?
 		var dirty: Bool?
 		var serverTags: [String: [String]]?
 		var pendingTagOps: [TagOp]?
+		/// Called foldersRev by builds that had groups.
 		var foldersRev: Int?
+		/// Builds before tags replaced groups (群組) kept these; each group
+		/// becomes a tag of the same name on its chats.
+		var groups: [LegacyGroup]?
+		var membership: [String: UUID]?
+	}
+
+	private struct LegacyGroup: Codable {
+		var id: UUID
+		var name: String
 	}
 
 	init(defaults: UserDefaults = .standard) {
 		self.defaults = defaults
 		if let data = defaults.data(forKey: Self.key), let stored = try? JSONDecoder().decode(Stored.self, from: data) {
-			groups = stored.groups
-			membership = stored.membership.filter { _, id in stored.groups.contains { $0.id == id } }
 			hidden = stored.hidden
-			collapsed = stored.collapsed
 			synced = stored.synced ?? false
 			dirty = stored.dirty ?? false
 			serverTags = stored.serverTags ?? [:]
 			pendingTagOps = stored.pendingTagOps ?? []
-			foldersRev = stored.foldersRev ?? 0
+			hiddenRev = stored.foldersRev ?? 0
+			if let groups = stored.groups {
+				pendingTagOps += Self.tagOps(groups: groups, membership: stored.membership ?? [:])
+				save()
+			}
 			showTags()
 		}
 	}
 
-	func group(of chatId: String) -> Group? {
-		membership[chatId].flatMap { id in groups.first { $0.id == id } }
+	/// An "add" per group with chats, so the server gives them the group's name as a tag.
+	private static func tagOps(groups: [LegacyGroup], membership: [String: UUID]) -> [TagOp] {
+		groups.compactMap { group in
+			let chats = membership.filter { $0.value == group.id }.keys.sorted()
+			let name = tagName(group.name)
+			return chats.isEmpty || name.isEmpty ? nil : TagOp(op: .add, tags: [String(name.prefix(40))], chatIds: chats)
+		}
 	}
 
 	func isHidden(_ chatId: String) -> Bool {
 		hidden[chatId] != nil
-	}
-
-	// MARK: Groups
-
-	@discardableResult
-	func addGroup(named name: String) -> Group? {
-		let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-		guard !trimmed.isEmpty else { return nil }
-		let group = Group(id: UUID(), name: trimmed)
-		groups.append(group)
-		changed()
-		return group
-	}
-
-	func rename(_ id: UUID, to name: String) {
-		let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-		guard !trimmed.isEmpty, let i = groups.firstIndex(where: { $0.id == id }) else { return }
-		groups[i].name = trimmed
-		changed()
-	}
-
-	/// Deletes the group; its chats go back to the ungrouped list.
-	func delete(_ id: UUID) {
-		groups.removeAll { $0.id == id }
-		membership = membership.filter { $0.value != id }
-		collapsed.remove(id)
-		changed()
-	}
-
-	func move(_ id: UUID, by offset: Int) {
-		guard let i = groups.firstIndex(where: { $0.id == id }) else { return }
-		let j = min(max(i + offset, 0), groups.count - 1)
-		guard i != j else { return }
-		groups.swapAt(i, j)
-		changed()
-	}
-
-	func moveGroups(from source: IndexSet, to destination: Int) {
-		groups.move(fromOffsets: source, toOffset: destination)
-		changed()
-	}
-
-	/// Puts a chat in a group, or takes it out with `nil`.
-	func assign(_ chatId: String, to groupId: UUID?) {
-		if let groupId, groups.contains(where: { $0.id == groupId }) {
-			membership[chatId] = groupId
-		} else {
-			membership[chatId] = nil
-		}
-		changed()
-	}
-
-	func setCollapsed(_ id: UUID, _ isCollapsed: Bool) {
-		if isCollapsed { collapsed.insert(id) } else { collapsed.remove(id) }
-		save()
 	}
 
 	// MARK: Hidden chats
@@ -246,25 +194,20 @@ final class Organizer {
 
 	// MARK: Server copy
 
-	/// Groups and hidden chats as the server stores them.
+	/// Hidden chats as the server stores them.
 	var shared: OrganizerState {
-		OrganizerState(
-			folders: groups.map { group in
-				.init(id: group.id, name: group.name, chatIds: membership.filter { $0.value == group.id }.keys.sorted())
-			},
-			hidden: hidden.map { .init(chatId: $0.key, name: $0.value) }.sorted { $0.chatId < $1.chatId },
-		)
+		OrganizerState(hidden: hidden.map { .init(chatId: $0.key, name: $0.value) }.sorted { $0.chatId < $1.chatId })
 	}
 
 	/// Brings this Mac and the server's copy together after connecting, and
 	/// returns what to send the server, if anything. The first time, both
 	/// sides are kept; after that, changes made here while offline win (the
-	/// server adds agents' changes back on top), and otherwise the server's
+	/// server adds agents' hides back on top), and otherwise the server's
 	/// copy (from another Mac or an agent) replaces this one.
 	func reconcile(with server: OrganizerState) -> OrganizerState? {
 		if !synced {
 			apply(Self.merged(local: shared, server: server))
-			foldersRev = server.rev ?? 0
+			hiddenRev = server.rev ?? 0
 			let merged = shared
 			dirty = !merged.sameContent(as: server)
 			save()
@@ -276,38 +219,26 @@ final class Organizer {
 	}
 
 	/// The server saved `sent` and now has `server`: the same, plus any agent
-	/// changes this Mac had not seen. Changes made here since keep it dirty.
+	/// hides this Mac had not seen. Changes made here since keep it dirty.
 	func markSaved(_ sent: OrganizerState, server: OrganizerState) {
 		guard dirty, shared.sameContent(as: sent) else { return }
 		dirty = false
 		apply(server)
 	}
 
-	/// Replaces groups and hidden chats with the server's.
+	/// Replaces hidden chats with the server's.
 	private func apply(_ state: OrganizerState) {
 		synced = true
-		if let rev = state.rev { foldersRev = rev }
+		if let rev = state.rev { hiddenRev = rev }
 		guard !state.sameContent(as: shared) else { return save() }
-		groups = state.folders.map { Group(id: $0.id, name: $0.name) }
-		membership = Dictionary(state.folders.flatMap { folder in folder.chatIds.map { ($0, folder.id) } }, uniquingKeysWith: { first, _ in first })
 		hidden = Dictionary(state.hidden.map { ($0.chatId, $0.name) }, uniquingKeysWith: { first, _ in first })
-		collapsed = collapsed.filter { id in groups.contains { $0.id == id } }
 		save()
 	}
 
-	/// Both sides' groups, matched by name; a chat already filed on the server stays there.
+	/// Both sides' hidden chats.
 	static func merged(local: OrganizerState, server: OrganizerState) -> OrganizerState {
-		var folders = server.folders
-		var filed = Set(folders.flatMap(\.chatIds))
-		for folder in local.folders {
-			let index = folders.firstIndex { $0.name.compare(folder.name, options: [.caseInsensitive, .widthInsensitive]) == .orderedSame }
-				?? { folders.append(.init(id: folder.id, name: folder.name, chatIds: [])); return folders.count - 1 }()
-			let added = folder.chatIds.filter { !filed.contains($0) }
-			folders[index].chatIds += added
-			filed.formUnion(added)
-		}
 		let serverHidden = Set(server.hidden.map(\.chatId))
-		return OrganizerState(folders: folders, hidden: server.hidden + local.hidden.filter { !serverHidden.contains($0.chatId) })
+		return OrganizerState(hidden: server.hidden + local.hidden.filter { !serverHidden.contains($0.chatId) })
 	}
 
 	private func changed() {
@@ -318,8 +249,8 @@ final class Organizer {
 
 	private func save() {
 		let stored = Stored(
-			groups: groups, membership: membership, hidden: hidden, collapsed: collapsed, synced: synced, dirty: dirty,
-			serverTags: serverTags, pendingTagOps: pendingTagOps, foldersRev: foldersRev,
+			hidden: hidden, synced: synced, dirty: dirty,
+			serverTags: serverTags, pendingTagOps: pendingTagOps, foldersRev: hiddenRev,
 		)
 		if let data = try? JSONEncoder().encode(stored) { defaults.set(data, forKey: Self.key) }
 	}

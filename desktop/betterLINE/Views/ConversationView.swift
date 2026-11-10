@@ -95,7 +95,7 @@ struct ConversationView: View {
 		case .room: parts.append("多人聊天室")
 		case .user: break
 		}
-		if let group = app.organizer.group(of: chat.chatId) { parts.append(group.name) }
+		parts += app.organizer.tags(of: chat.chatId)
 		if app.isArchived(chat.chatId) { parts.append("已封存") }
 		if chat.isMuted { parts.append("已靜音") }
 		return parts.joined(separator: " · ")

@@ -15,7 +15,7 @@ process.env.LINE_CLIENT_KEY = key;
 const amy = "u" + "a".repeat(32);
 const work = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 
-test("the desktop changes tags with ops, and its folder saves keep them", async () => {
+test("the desktop changes tags with ops, and its saves of hidden chats keep them", async () => {
 	const { startClientApi } = await import("./clientapi.ts");
 	const organizer = new Organizer(join(process.env.LINE_MCP_STATE_DIR!, "organizer.json"));
 	const server = startClientApi({} as never, {} as never, {} as never, organizer);
@@ -37,8 +37,10 @@ test("the desktop changes tags with ops, and its folder saves keep them", async 
 		assert.deepEqual(tagged.body.tags, [{ chat_id: amy, tags: ["讀書會幹部"] }]);
 		assert.equal(tagged.body.rev, 1);
 
-		const saved = await send("PUT", "/api/organizer", { folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [] });
+		// An app from before tags replaced folders still sends folders; they are ignored.
+		const saved = await send("PUT", "/api/organizer", { folders: [{ id: work, name: "Work", chat_ids: [amy] }], hidden: [], base_rev: 1 });
 		assert.deepEqual(saved.body.tags, [{ chat_id: amy, tags: ["讀書會幹部"] }]);
+		assert.deepEqual(saved.body.folders, [], "an empty list, so such an app drops its folders");
 		assert.equal(saved.body.rev, 2);
 		assert.deepEqual((await send("GET", "/api/organizer")).body, saved.body);
 

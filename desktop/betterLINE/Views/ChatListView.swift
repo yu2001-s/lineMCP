@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ChatListView: View {
@@ -27,7 +28,7 @@ struct ChatListView: View {
 		.safeAreaInset(edge: .top, spacing: 0) {
 			VStack(spacing: 0) {
 				StatusStrip()
-				if !isSearching { TagFilterStrip() }
+				if !isSearching { TagBar() }
 			}
 		}
 		.overlay { placeholder }
@@ -50,27 +51,9 @@ struct ChatListView: View {
 
 	@ViewBuilder
 	private var sections: some View {
-		let sections = app.sidebarSections
-		let hasGroups = sections.contains { $0.group != nil }
-		ForEach(sections) { section in
-			if let group = section.group {
-				Section(isExpanded: expanded(group)) {
-					if section.chats.isEmpty, section.archived.isEmpty {
-						Text("在聊天室上按右鍵，選「移到群組」")
-							.font(.caption)
-							.foregroundStyle(.tertiary)
-					}
-					rows(section)
-				} header: {
-					GroupHeader(name: group.name, unread: section.unread, collapsed: app.organizer.collapsed.contains(group.id))
-						.contextMenu { groupMenu(group) }
-				}
-			} else if section.id == "older" {
+		ForEach(app.sidebarSections) { section in
+			if section.id == "older" {
 				Section("較早的聊天（僅封存）") { rows(section) }
-			} else if hasGroups {
-				if !section.chats.isEmpty {
-					Section("其他") { rows(section) }
-				}
 			} else {
 				rows(section)
 			}
@@ -89,13 +72,6 @@ struct ChatListView: View {
 				.tag(archived.chatId)
 				.contextMenu { chatMenu(archived.chatId, unread: 0) }
 		}
-	}
-
-	private func expanded(_ group: Organizer.Group) -> Binding<Bool> {
-		Binding(
-			get: { !app.organizer.collapsed.contains(group.id) },
-			set: { app.organizer.setCollapsed(group.id, !$0) },
-		)
 	}
 
 	// MARK: Menus
@@ -126,17 +102,6 @@ struct ChatListView: View {
 
 	private func chatMenu(_ chatId: String, unread: Int) -> some View {
 		ChatActions(chatId: chatId, unread: unread)
-	}
-
-	@ViewBuilder
-	private func groupMenu(_ group: Organizer.Group) -> some View {
-		Button("重新命名…") { app.promptRename(group) }
-		Button("上移") { app.organizer.move(group.id, by: -1) }
-			.disabled(app.organizer.groups.first?.id == group.id)
-		Button("下移") { app.organizer.move(group.id, by: 1) }
-			.disabled(app.organizer.groups.last?.id == group.id)
-		Divider()
-		Button("刪除群組") { app.organizer.delete(group.id) }
 	}
 
 	// MARK: Search
@@ -218,24 +183,6 @@ struct ChatListView: View {
 			Text("最近 14 天沒有聊天").foregroundStyle(.secondary)
 		} else if !isSearching, !app.activeTagFilter.isEmpty, app.sidebarSections.allSatisfy({ $0.chats.isEmpty && $0.archived.isEmpty }) {
 			Text("沒有符合標籤的聊天室").foregroundStyle(.secondary)
-		}
-	}
-}
-
-private struct GroupHeader: View {
-	let name: String
-	let unread: Int
-	let collapsed: Bool
-
-	var body: some View {
-		HStack {
-			Text(name)
-			if collapsed, unread > 0 {
-				Spacer()
-				Text(unread > 999 ? "999+" : String(unread))
-					.font(.caption2.weight(.semibold).monospacedDigit())
-					.foregroundStyle(.secondary)
-			}
 		}
 	}
 }
@@ -380,47 +327,80 @@ private struct SearchHitRow: View {
 	}
 }
 
-/// The tags the list is limited to, above it; clicking one drops it.
-private struct TagFilterStrip: View {
+/// Every tag above the list, to view chats by tag: clicking one shows only
+/// its chats (clicking it again shows every chat), ⌘-click adds it to or
+/// drops it from the tags shown. Each tag shows its unread count.
+private struct TagBar: View {
 	@Environment(AppModel.self) private var app
 
 	var body: some View {
-		let tags = app.activeTagFilter.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+		let tags = app.organizer.allTags
+		let active = app.activeTagFilter
 		if !tags.isEmpty {
 			HStack(spacing: 6) {
-				Image(systemName: "tag")
-					.font(.caption)
-					.foregroundStyle(.secondary)
 				ScrollView(.horizontal, showsIndicators: false) {
 					HStack(spacing: 4) {
+						Button {
+							app.tagFilter = []
+						} label: {
+							TagBarItem(name: "全部", unread: 0, selected: active.isEmpty, tinted: false)
+						}
+						.buttonStyle(.plain)
+						.help("顯示所有聊天室")
 						ForEach(tags, id: \.self) { tag in
 							Button {
-								app.toggleTagFilter(tag)
+								if NSEvent.modifierFlags.contains(.command) {
+									app.toggleTagFilter(tag)
+								} else {
+									app.showOnly(tag: tag)
+								}
 							} label: {
-								TagChip(name: tag)
+								TagBarItem(name: tag, unread: app.unread(tagged: tag), selected: active.contains(tag), tinted: true)
 							}
 							.buttonStyle(.plain)
-							.help("不再依「\(tag)」篩選")
+							.help("只顯示「\(tag)」的聊天室（⌘-點按可同時選多個標籤）")
 						}
-						if tags.count > 1 {
+						if active.count > 1 {
 							Text(app.tagFilterMatchAll ? "（全部符合）" : "（任一符合）")
 								.font(.caption2)
 								.foregroundStyle(.secondary)
 						}
 					}
 				}
-				Button {
-					app.tagFilter = []
-				} label: {
-					Image(systemName: "xmark.circle.fill")
-				}
-				.buttonStyle(.plain)
-				.foregroundStyle(.secondary)
-				.help("顯示所有聊天室")
 			}
 			.padding(.horizontal, 12)
 			.padding(.bottom, 6)
 		}
+	}
+}
+
+/// One tag in the tag bar: its chip, dimmed unless selected, with its unread count.
+private struct TagBarItem: View {
+	let name: String
+	let unread: Int
+	let selected: Bool
+	let tinted: Bool
+
+	var body: some View {
+		HStack(spacing: 3) {
+			if tinted {
+				TagChip(name: name)
+			} else {
+				Text(name)
+					.font(.caption2.weight(.medium))
+					.padding(.horizontal, 5)
+					.padding(.vertical, 1)
+					.background(Color.secondary.opacity(0.15), in: Capsule())
+			}
+			if unread > 0 {
+				Text(unread > 99 ? "99+" : String(unread))
+					.font(.caption2.weight(.semibold).monospacedDigit())
+					.foregroundStyle(.secondary)
+			}
+		}
+		.padding(2)
+		.overlay(Capsule().strokeBorder(Color.accentColor, lineWidth: selected ? 1.5 : 0))
+		.opacity(selected ? 1 : 0.6)
 	}
 }
 

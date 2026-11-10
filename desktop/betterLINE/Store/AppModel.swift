@@ -41,16 +41,18 @@ final class AppModel {
 	var searchRequests = 0
 	/// The new-chat (address book) sheet, opened with ⌘N.
 	var showingNewChat = false
-	/// The name prompt for creating or renaming a chat group.
-	var groupPrompt: GroupPrompt?
-	var groupNameDraft = ""
 	/// The name prompt for adding a tag to a chat or renaming one.
 	var tagPrompt: TagPrompt?
 	var tagNameDraft = ""
-	/// Tags the chat list is limited to; empty shows every chat.
-	var tagFilter: Set<String> = []
+	/// Tags the chat list is limited to; empty shows every chat. Kept across
+	/// launches, so a view such as Work stays put.
+	var tagFilter: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "tagFilter") ?? []) {
+		didSet { UserDefaults.standard.set(tagFilter.sorted(), forKey: "tagFilter") }
+	}
 	/// With `tagFilter`, show only chats that have every one of its tags.
-	var tagFilterMatchAll = false
+	var tagFilterMatchAll = UserDefaults.standard.bool(forKey: "tagFilterMatchAll") {
+		didSet { UserDefaults.standard.set(tagFilterMatchAll, forKey: "tagFilterMatchAll") }
+	}
 	/// Whether the main window is frontmost and visible.
 	var windowActive = false {
 		didSet {
@@ -259,9 +261,9 @@ final class AppModel {
 		return results
 	}
 
-	/// Groups, hidden chats and tags live on the server too, so the MCP tools
-	/// and other Macs see them. A server without `/api/organizer` is left
-	/// alone. After an organizer event, groups are left alone while this Mac
+	/// Hidden chats and tags live on the server too, so the MCP tools and
+	/// other Macs see them. A server without `/api/organizer` is left alone.
+	/// After an organizer event, hidden chats are left alone while this Mac
 	/// has its own changes to send: our own saves echo back too.
 	func syncOrganizer(event: Bool = false) async {
 		guard let api, let server = try? await api.organizer() else { return }
@@ -286,7 +288,7 @@ final class AppModel {
 
 	/// A failed push leaves the organizer dirty; the next connect sends it.
 	private func pushOrganizer(_ state: OrganizerState) async {
-		guard let api, let saved = try? await api.saveOrganizer(state, baseRev: organizer.foldersRev) else { return }
+		guard let api, let saved = try? await api.saveOrganizer(state, baseRev: organizer.hiddenRev) else { return }
 		let hiddenBefore = organizer.hidden
 		organizer.markSaved(state, server: saved)
 		organizer.receiveTags(saved)
@@ -490,40 +492,34 @@ final class AppModel {
 		tagFilter.intersection(organizer.allTags)
 	}
 
-	/// The sidebar: one section per group in the owner's order, then ungrouped
-	/// chats, then archive-only ones, all limited to the tag filter. Hidden
-	/// chats appear nowhere.
+	/// The sidebar: recent chats, then archive-only ones, both limited to the
+	/// tag filter. Hidden chats appear nowhere.
 	var sidebarSections: [SidebarSection] {
 		let filter = activeTagFilter
 		let shown = { [organizer, tagFilterMatchAll] (chatId: String) in
 			filter.isEmpty || organizer.matches(chatId, tags: filter, all: tagFilterMatchAll)
 		}
-		let visible = chats.filter { !organizer.isHidden($0.chatId) && shown($0.chatId) }
+		var sections = [SidebarSection(id: "recent", chats: chats.filter { !organizer.isHidden($0.chatId) && shown($0.chatId) }, archived: [])]
 		let older = archiveOnlyChats.filter { shown($0.chatId) }
-		var sections = organizer.groups.map { group in
-			SidebarSection(
-				id: group.id.uuidString,
-				group: group,
-				chats: visible.filter { organizer.membership[$0.chatId] == group.id },
-				archived: older.filter { organizer.membership[$0.chatId] == group.id },
-			)
-		}
-		if !filter.isEmpty {
-			sections.removeAll { $0.chats.isEmpty && $0.archived.isEmpty }
-		}
-		sections.append(SidebarSection(id: "ungrouped", group: nil, chats: visible.filter { organizer.group(of: $0.chatId) == nil }, archived: []))
-		let olderUngrouped = older.filter { organizer.group(of: $0.chatId) == nil }
-		if !olderUngrouped.isEmpty {
-			sections.append(SidebarSection(id: "older", group: nil, chats: [], archived: olderUngrouped))
+		if !older.isEmpty {
+			sections.append(SidebarSection(id: "older", chats: [], archived: older))
 		}
 		return sections
 	}
 
-	// MARK: Organizing
-
-	func move(_ chatId: String, toGroup groupId: UUID?) {
-		organizer.assign(chatId, to: groupId)
+	/// Unread messages in chats with `tag`, for the sidebar's tag bar.
+	func unread(tagged tag: String) -> Int {
+		chats.reduce(0) { total, chat in
+			chat.isMuted || organizer.isHidden(chat.chatId) || !organizer.tags(of: chat.chatId).contains(tag) ? total : total + chat.unread
+		}
 	}
+
+	/// Shows only chats with `tag`, or every chat if that is already the view.
+	func showOnly(tag: String) {
+		tagFilter = activeTagFilter == [tag] ? [] : [tag]
+	}
+
+	// MARK: Organizing
 
 	/// Hides a chat from the list, search, badge and notifications.
 	func hide(_ chatId: String) {
@@ -536,30 +532,6 @@ final class AppModel {
 	func unhide(_ chatId: String) {
 		organizer.unhide(chatId)
 		updateBadge()
-	}
-
-	func promptNewGroup(assigning chatId: String? = nil) {
-		groupNameDraft = ""
-		groupPrompt = .new(assigning: chatId)
-	}
-
-	func promptRename(_ group: Organizer.Group) {
-		groupNameDraft = group.name
-		groupPrompt = .rename(group)
-	}
-
-	func commitGroupPrompt() {
-		switch groupPrompt {
-		case let .new(chatId):
-			if let group = organizer.addGroup(named: groupNameDraft), let chatId {
-				organizer.assign(chatId, to: group.id)
-			}
-		case let .rename(group):
-			organizer.rename(group.id, to: groupNameDraft)
-		case nil:
-			break
-		}
-		groupPrompt = nil
 	}
 
 	func promptNewTag(for chatId: String) {
@@ -612,10 +584,9 @@ final class AppModel {
 		Task { await conversation.reveal(messageId: hit.message.id, timeMs: hit.message.timeMs) }
 	}
 
-	/// Moves through the sidebar as shown, skipping collapsed groups.
+	/// Moves through the sidebar as shown.
 	func selectAdjacent(_ step: Int) {
 		let order = sidebarSections
-			.filter { $0.group.map { !organizer.collapsed.contains($0.id) } ?? true }
 			.flatMap { $0.chats.map(\.chatId) + $0.archived.map(\.chatId) }
 		guard !order.isEmpty else { return }
 		let index = order.firstIndex { $0 == selectedChatId } ?? -step
@@ -692,17 +663,8 @@ final class AppModel {
 
 struct SidebarSection: Identifiable {
 	let id: String
-	/// nil for the ungrouped and archive-only sections.
-	let group: Organizer.Group?
 	let chats: [Chat]
 	let archived: [ArchivedChat]
-
-	var unread: Int { chats.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unread) } }
-}
-
-enum GroupPrompt {
-	case new(assigning: String?)
-	case rename(Organizer.Group)
 }
 
 enum TagPrompt {

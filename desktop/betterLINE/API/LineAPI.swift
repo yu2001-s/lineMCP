@@ -168,12 +168,12 @@ final class LineAPI: Sendable {
 		try await get("api/organizer")
 	}
 
-	/// Saves groups and hidden chats. `baseRev` is the server revision whose
+	/// Saves hidden chats. `baseRev` is the server revision whose
 	/// agent changes they include; the server adds later ones on top.
 	@discardableResult
 	func saveOrganizer(_ state: OrganizerState, baseRev: Int) async throws -> OrganizerState {
 		var req = request("PUT", "api/organizer")
-		req.httpBody = try JSONEncoder.api.encode(OrganizerSave(folders: state.folders, hidden: state.hidden, baseRev: baseRev))
+		req.httpBody = try JSONEncoder.api.encode(OrganizerSave(hidden: state.hidden, baseRev: baseRev))
 		req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 		return try await send(req)
 	}

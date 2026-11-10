@@ -11,7 +11,7 @@ export const config = {
 	sendLogPath: join(stateDir, "sent.log"),
 	archivePath: join(stateDir, "archive.db"),
 	mediaCacheDir: join(stateDir, "media-cache"),
-	/** Folders and hidden chats from the desktop app. */
+	/** Hidden chats and tags, shared by the desktop app and the MCP tools. */
 	organizerPath: join(stateDir, "organizer.json"),
 	/** Listeners the agents set up through the tools. */
 	listenersPath: join(stateDir, "listeners.json"),

@@ -97,7 +97,7 @@ export type LineEvent =
 	| { type: "chat_read"; chat_id: string; message_id: string }
 	| { type: "reaction"; chat_id: string; message_id?: string }
 	| { type: "chat_update"; chat_id: string }
-	/** The desktop app saved new folders or hidden chats. */
+	/** Hidden chats or tags changed, from the desktop app or an agent. */
 	| { type: "organizer" }
 	| { type: "status"; status: LineStatus };
 

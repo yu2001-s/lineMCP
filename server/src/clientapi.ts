@@ -143,15 +143,15 @@ export function startClientApi(line: LineService, archive: Archive, sync: Archiv
 		}],
 		["GET", /^\/api\/archive$/, async () => ({ rules: archive.policy(), chats: archive.chats() })],
 		["POST", /^\/api\/archive\/sync$/, async () => ({ results: await sync.syncAll() })],
-		["GET", /^\/api\/organizer$/, async () => organizer.state()],
+		["GET", /^\/api\/organizer$/, async () => forOlderApps(organizer.state())],
 		["PUT", /^\/api\/organizer$/, async (req) => {
 			const body = await readJson(req) as { base_rev?: unknown };
 			const baseRev = typeof body.base_rev === "number" ? body.base_rev : undefined;
-			return organizerInput(() => organizer.replace(body, baseRev));
+			return forOlderApps(organizerInput(() => organizer.replace(body, baseRev)));
 		}],
 		["POST", /^\/api\/organizer\/tags$/, async (req) => {
 			const body = await readJson(req) as { ops?: unknown };
-			return organizerInput(() => organizer.changeTags(body.ops));
+			return forOlderApps(organizerInput(() => organizer.changeTags(body.ops)));
 		}],
 	];
 
@@ -191,6 +191,14 @@ export function startClientApi(line: LineService, archive: Archive, sync: Archiv
 }
 
 const RESPONDED = Symbol("responded");
+
+/**
+ * betterLINE builds from before tags replaced folders fail to read an
+ * organizer without `folders`; an empty list makes them drop their folders.
+ */
+function forOlderApps<T extends object>(state: T): T & { folders: [] } {
+	return { ...state, folders: [] };
+}
 
 function organizerInput<T>(change: () => T): T {
 	try {
